@@ -1,0 +1,10 @@
+# Local-only HTTP configuration. No public certificate is requested.
+{
+	auto_https off
+	admin off
+}
+
+http://mt5.nazbeen.test {
+	bind 127.0.0.1
+	reverse_proxy 127.0.0.1:8080
+}
