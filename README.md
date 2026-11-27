@@ -218,7 +218,7 @@ The installer registers logon tasks named:
 | `NazbeenMT5API` | FastAPI service | ~60 seconds after logon | Restart on failure, up to 3 attempts at ~1 minute intervals |
 | `NazbeenMT5Proxy` | Caddy reverse proxy | ~90 seconds after logon | Restart on failure, up to 3 attempts at ~1 minute intervals |
 
-The installer uses ~30s for the terminal, ~30s for the API, and ~45s for Caddy. On this machine `NazbeenMT5Terminal` and `NazbeenMT5API` are installed and Ready. `NazbeenMT5Proxy` was initially skipped because Caddy was missing; with `tools\caddy.exe` and `CADDY_PATH` configured, re-run `powershell -ExecutionPolicy Bypass -File .\scripts\install_autostart.ps1` to register it.
+The helpers provide the staggering: the terminal starts first, the API waits ~30s for it, and Caddy waits ~45s. All three tasks are registered and Ready on this machine. They are also configured to start and continue **on battery power**, to run if a logon trigger was missed, and to retry up to 3 times after failure. This matters on laptops: Task Scheduler's default battery settings otherwise silently skip the services after a reboot.
 
 Useful commands:
 

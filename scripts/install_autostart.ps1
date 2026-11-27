@@ -59,7 +59,19 @@ function New-LogonTask {
         $userId = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
         $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+
+        # Laptops must still start the local services on battery. Task Scheduler
+        # defaults otherwise silently skip these logon tasks and leave the API
+        # unavailable after a reboot.
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -MultipleInstances IgnoreNew
+
+        Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 
         $registered = Get-ScheduledTask -TaskName $Name -ErrorAction Stop
         if ($registered.Actions[0].Arguments -like ('*{0}*' -f $HelperFile)) {
