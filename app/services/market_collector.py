@@ -49,7 +49,10 @@ class MarketCollector:
         self._last_poll_at: str | None = None
         self._last_error: str | None = None
         self._last_latency_ms = 0.0
+        # Wall bucket throttles expensive history calls; epoch prevents a
+        # repeated candle from being emitted across a bucket boundary.
         self._last_candle_bucket: dict[tuple[str, str], int] = {}
+        self._last_candle_epoch: dict[tuple[str, str], int] = {}
         self._candle_events = 0
 
     @property
@@ -65,7 +68,7 @@ class MarketCollector:
             "last_error": self._last_error,
             "default_symbols": list(self._default_symbols),
             "candle_events": self._candle_events,
-            "candle_pairs": len(self._last_candle_bucket),
+            "candle_pairs": len(self._last_candle_epoch),
         }
 
     async def start(self) -> None:
@@ -119,19 +122,32 @@ class MarketCollector:
             return
         quotes = await asyncio.to_thread(self.quote_service.get_quotes, symbols)
         errors = 0
+        failed: list[str] = []
         for quote in quotes:
-            if quote.get("status") != "ok":
+            status = quote.get("status")
+            if status != "ok":
                 errors += 1
+                failed.append(f"{quote['symbol']}={status}")
             self.cache.set(quote)
             if self.subscriptions.has_subscribers(quote["symbol"]):
                 self.subscriptions.publish(
                     quote["symbol"], {"type": "quote", "data": quote}
                 )
-        if not errors:
+        if errors:
+            self._last_error = (
+                f"{errors}/{len(quotes)} quote(s) unavailable: {', '.join(failed[:5])}"
+            )
+        else:
+            self._last_error = None
             self.manager.mark_success()
         if self._poll_count % 120 == 1:
-            record_collector_stat(
-                self.session_factory, len(symbols), self._last_latency_ms, errors
+            # SQLite writes must not block the event loop.
+            await asyncio.to_thread(
+                record_collector_stat,
+                self.session_factory,
+                len(symbols),
+                self._last_latency_ms,
+                errors,
             )
 
     async def _poll_candles(self) -> None:
@@ -139,17 +155,19 @@ class MarketCollector:
             return
         pairs = self.subscriptions.candle_targets()
         active = set(pairs)
-        for key in list(self._last_candle_bucket):
+        for key in list(self._last_candle_epoch):
             if key not in active:
+                self._last_candle_epoch.pop(key, None)
                 self._last_candle_bucket.pop(key, None)
                 self.candle_cache.remove(*key)
         now = time.time()
         for symbol, timeframe in pairs:
+            key = (symbol, timeframe)
             seconds = TIMEFRAME_SECONDS.get(timeframe)
             if not seconds:
                 continue
             bucket = int(now // seconds)
-            if self._last_candle_bucket.get((symbol, timeframe)) == bucket:
+            if self._last_candle_bucket.get(key) == bucket:
                 continue
             try:
                 result = await asyncio.to_thread(
@@ -159,7 +177,14 @@ class MarketCollector:
                 if not completed:
                     continue
                 candle = max(completed, key=lambda item: item.get("epoch", 0))
-                self._last_candle_bucket[(symbol, timeframe)] = bucket
+                # Wall-clock buckets can repeat across polls and can drift from
+                # broker time; the candle epoch is the only reliable dedupe key.
+                epoch = int(candle.get("epoch") or 0)
+                last_epoch = self._last_candle_epoch.get(key)
+                if last_epoch is not None and epoch <= last_epoch:
+                    continue
+                self._last_candle_epoch[key] = epoch
+                self._last_candle_bucket[key] = bucket
                 self.candle_cache.set(symbol, timeframe, candle)
                 self._candle_events += 1
                 self.subscriptions.publish_candle(
@@ -185,7 +210,6 @@ class MarketCollector:
                 await self._poll_quotes()
                 self._poll_count += 1
                 self._last_poll_at = timestamp_to_iso(time.time())
-                self._last_error = None
                 await self._poll_candles()
                 if self._poll_count % 60 == 0:
                     for client_id in self.subscriptions.cleanup_stale():
@@ -200,7 +224,9 @@ class MarketCollector:
             await asyncio.sleep(max(0.01, self.settings.MARKET_POLL_INTERVAL - elapsed))
 
     async def on_connection_event(self, connected: bool, message: str) -> None:
-        record_event(
+        # SQLite writes must not block the event loop.
+        await asyncio.to_thread(
+            record_event,
             self.session_factory,
             "connection",
             message,

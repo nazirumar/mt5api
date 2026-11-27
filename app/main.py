@@ -71,7 +71,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cache = QuoteCache()
         candle_cache = CandleCache()
         subscriptions = SubscriptionManager(
-            stale_timeout=settings.WEBSOCKET_STALE_TIMEOUT
+            stale_timeout=settings.WEBSOCKET_STALE_TIMEOUT,
+            max_clients=settings.WEBSOCKET_MAX_CLIENTS,
         )
         history_limiter = HistoryLimiter(settings)
         collector = MarketCollector(
@@ -102,13 +103,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         record_event(database["session_factory"], "startup", "API starting")
         # Initialization always happens at startup; DISABLE_BACKGROUND only
         # suppresses the long-running collector/monitor loops (useful in tests).
-        initialized = await manager.initialize_async()
-        if not initialized:
-            runtime.startup_errors.append("MT5 initialization failed")
+        try:
+            initialized = await manager.initialize_async()
+        except Exception as exc:
+            # A missing MetaTrader5 package (or any other startup failure) must
+            # not abort the API lifespan. Report only the exception type so a
+            # credential accidentally included in an error string is not logged.
+            initialized = False
+            startup_error = f"MT5 initialization error: {type(exc).__name__}"
+            runtime.startup_errors.append(startup_error)
+            logger.warning("%s", startup_error)
             record_event(
                 database["session_factory"], "connection",
-                "MT5 initialization failed", level="WARNING",
+                startup_error, level="WARNING",
             )
+        else:
+            if not initialized:
+                runtime.startup_errors.append("MT5 initialization failed")
+                record_event(
+                    database["session_factory"], "connection",
+                    "MT5 initialization failed", level="WARNING",
+                )
         if not settings.DISABLE_BACKGROUND:
             await collector.start()
             await monitor.start()
@@ -117,7 +132,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await monitor.stop()
             await collector.stop()
-            manager.shutdown()
+            await asyncio.to_thread(manager.shutdown)
             record_event(database["session_factory"], "shutdown", "API stopped")
             database["engine"].dispose()
 

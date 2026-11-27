@@ -19,21 +19,46 @@ class Client:
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=64))
     connected_at: float = field(default_factory=time.monotonic)
     last_seen: float = field(default_factory=time.monotonic)
+    authenticated: bool = False
 
 
 class SubscriptionManager:
     """One shared market feed fans out to every subscribed client."""
 
-    def __init__(self, max_queue: int = 64, stale_timeout: float = 90.0):
+    def __init__(
+        self,
+        max_queue: int = 64,
+        stale_timeout: float = 90.0,
+        max_clients: int = 100,
+    ):
         self._clients: dict[int, Client] = {}
         self._counter = itertools.count(1)
         self._max_queue = max_queue
         self._stale_timeout = stale_timeout
+        self._max_clients = max_clients
+
+    @property
+    def max_clients(self) -> int:
+        return self._max_clients
+
+    def has_capacity(self) -> bool:
+        return len(self._clients) < self._max_clients
 
     def connect(self) -> int:
+        if not self.has_capacity():
+            raise RuntimeError("WebSocket client limit reached")
         client_id = next(self._counter)
         self._clients[client_id] = Client(id=client_id, queue=asyncio.Queue(maxsize=self._max_queue))
         return client_id
+
+    def authenticate(self, client_id: int) -> None:
+        client = self._clients.get(client_id)
+        if client:
+            client.authenticated = True
+
+    def is_authenticated(self, client_id: int) -> bool:
+        client = self._clients.get(client_id)
+        return bool(client and client.authenticated)
 
     def touch(self, client_id: int) -> None:
         client = self._clients.get(client_id)
@@ -138,7 +163,8 @@ class SubscriptionManager:
 
     def publish_all(self, message: dict[str, Any]) -> None:
         for client in list(self._clients.values()):
-            self._enqueue(client, message)
+            if client.authenticated:
+                self._enqueue(client, message)
 
     def _enqueue(self, client: Client, message: dict[str, Any]) -> None:
         try:

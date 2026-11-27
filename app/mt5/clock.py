@@ -37,12 +37,14 @@ class BrokerClock:
         self._zone: ZoneInfo | None = None
         self._offset_seconds: int | None = None
         self._observed_at = 0.0
+        self._invalid_timezone: str | None = None
 
         timezone_name = str(getattr(settings, "MT5_SERVER_TIMEZONE", "") or "").strip()
         if timezone_name:
             try:
                 self._zone = ZoneInfo(timezone_name)
             except (ZoneInfoNotFoundError, ValueError) as exc:
+                self._invalid_timezone = timezone_name
                 logger.warning(
                     "Invalid MT5_SERVER_TIMEZONE '%s': %s. Falling back to offset auto-detection.",
                     timezone_name,
@@ -58,13 +60,34 @@ class BrokerClock:
         return int(self._offset_seconds or 0)
 
     def describe(self) -> dict[str, Any]:
+        explicit = getattr(self.settings, "MT5_SERVER_UTC_OFFSET_MINUTES", None)
+        if self._zone is not None:
+            source = "iana"
+        elif explicit is not None:
+            source = "explicit"
+        elif self._offset_seconds is not None:
+            source = "auto"
+        else:
+            source = "unsampled"
+        warning: str | None = None
+        if self._invalid_timezone:
+            warning = (
+                f"Invalid MT5_SERVER_TIMEZONE '{self._invalid_timezone}'; "
+                f"using {source} offset."
+            )
+        elif source == "unsampled":
+            warning = (
+                "Broker UTC offset is not configured and no fresh tick has been observed; "
+                "exported timestamps may be wrong."
+            )
         return {
             "timezone": str(getattr(self.settings, "MT5_SERVER_TIMEZONE", "") or "") or None,
             "utc_offset_minutes": (
                 None if self._offset_seconds is None else self._offset_seconds // 60
             ),
-            "auto_detected": self._offset_seconds is not None
-            and getattr(self.settings, "MT5_SERVER_UTC_OFFSET_MINUTES", None) is None,
+            "auto_detected": source == "auto",
+            "source": source,
+            "warning": warning,
         }
 
     def observe_from_tick(self, tick: Any | None) -> None:
@@ -95,8 +118,11 @@ class BrokerClock:
             sample_seconds = float(broker_epoch_seconds)
         except (TypeError, ValueError):
             return
+        # A broker behind UTC makes a fresh tick look old to the host clock.
+        # Accept samples up to MAX_FUTURE_SKEW_SECONDS in either direction;
+        # historical samples are excluded by callers, not by this bound.
         if (
-            sample_seconds < now - self.MAX_OBSERVATION_AGE_SECONDS
+            sample_seconds < now - self.MAX_FUTURE_SKEW_SECONDS
             or sample_seconds > now + self.MAX_FUTURE_SKEW_SECONDS
         ):
             return
@@ -112,10 +138,13 @@ class BrokerClock:
                 "Detected broker UTC offset: %d minutes (from MT5 timestamps)",
                 candidate // 60,
             )
-        elif candidate > self._offset_seconds:
+        elif candidate != self._offset_seconds:
+            # Refresh in both directions so DST fall-back is detected too.
+            previous = self._offset_seconds
             self._offset_seconds = candidate
             logger.info(
-                "Refined broker UTC offset: %d minutes (from a fresher MT5 timestamp)",
+                "Refined broker UTC offset: %d -> %d minutes (from MT5 timestamps)",
+                previous // 60,
                 candidate // 60,
             )
 
@@ -136,7 +165,12 @@ class BrokerClock:
             self.observe(float(sample) / 1000.0 if abs(float(sample)) > 1e11 else sample)
         value = float(broker_epoch_ms)
         seconds = value / 1000.0 if abs(value) > 1e11 else value
-        return int(round(self.to_utc_epoch(seconds) * 1000.0))
+        if self._zone is not None:
+            naive = datetime.fromtimestamp(seconds, tz=timezone.utc).replace(tzinfo=None)
+            utc_dt = naive.replace(tzinfo=self._zone).astimezone(timezone.utc)
+            return int(round(utc_dt.timestamp() * 1000.0))
+        # Preserve broker millisecond precision instead of truncating to seconds.
+        return int(round((seconds - self.offset_seconds) * 1000.0))
 
     def to_iso(self, broker_epoch_seconds: Any, sample: Any | None = None) -> str | None:
         return timestamp_to_iso(self.to_utc_epoch(broker_epoch_seconds, sample))
@@ -157,19 +191,40 @@ class BrokerClock:
             broker_wall = (utc_datetime + timedelta(seconds=self.offset_seconds)).replace(tzinfo=None)
         return broker_wall.replace(tzinfo=timezone.utc)
 
+    @staticmethod
+    def _is_completed(utc_epoch: int, timeframe_seconds: int, timeframe: str | None, now: int) -> bool:
+        if timeframe == "MN1":
+            opened = datetime.fromtimestamp(utc_epoch, tz=timezone.utc)
+            if opened.month == 12:
+                next_open = opened.replace(
+                    year=opened.year + 1, month=1, day=1,
+                    hour=0, minute=0, second=0, microsecond=0,
+                )
+            else:
+                next_open = opened.replace(
+                    month=opened.month + 1, day=1,
+                    hour=0, minute=0, second=0, microsecond=0,
+                )
+            return int(next_open.timestamp()) <= now
+        return utc_epoch + int(timeframe_seconds) <= now
+
     def convert_candles(
         self,
         candles: list[dict[str, Any]],
         timeframe_seconds: int,
         sample_epoch_seconds: Any | None = None,
+        timeframe: str | None = None,
     ) -> list[dict[str, Any]]:
-        self.observe(sample_epoch_seconds)
+        # Historical samples must never seed the clock; only fresh live ticks do.
+        self.observe(sample_epoch_seconds if sample_epoch_seconds is not None else None)
         now = int(time.time())
         for candle in candles:
             utc_epoch = self.to_utc_epoch(candle.get("epoch", 0))
             candle["epoch"] = utc_epoch
             candle["time"] = timestamp_to_iso(utc_epoch)
-            candle["completed"] = utc_epoch + int(timeframe_seconds) <= now
+            candle["completed"] = self._is_completed(
+                utc_epoch, timeframe_seconds, timeframe, now
+            )
         return candles
 
     def convert_ticks(

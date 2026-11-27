@@ -36,7 +36,7 @@ $effectivePort = if ($Port -gt 0) { $Port } else { Get-ApiPort }
 Write-Step ("Starting API on port {0}" -f $effectivePort)
 
 $listeners = @(Get-PortListeners -Port $effectivePort)
-$apiProcesses = @(Get-ApiProcesses)
+$apiProcesses = @(Get-ApiProcesses -Port $effectivePort)
 if ($listeners.Count -gt 0 -or $apiProcesses.Count -gt 0) {
     Write-Ok ("API already active (listener PID(s): {0}; API PID(s): {1}). No duplicate started." -f `
         (($listeners.OwningProcess) -join ', '), (($apiProcesses.ProcessId) -join ', '))

@@ -51,6 +51,10 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_common.ps1')
 
+# Warnings (for example a missing MT5 terminal) are expected on partial setups;
+# only the failures below make the installer exit non-zero.
+$installFailed = $false
+
 function Invoke-PreferredPython {
     param(
         [Parameter(Mandatory)][object]$Python,
@@ -69,6 +73,7 @@ $python = Find-Python -Preferred $PythonPath
 if ($null -eq $python) {
     Write-Fail 'No usable Python installation was found.'
     Write-Hint 'Install Python 3.12+, add it to PATH, or re-run with -PythonPath "C:\path\to\python.exe".'
+    $installFailed = $true
 } elseif (-not $python.MeetsMinimum) {
     Write-WarnMsg ("Found Python {0} at {1}; version 3.12+ is recommended." -f $python.Version, $python.Path)
 } else {
@@ -89,6 +94,7 @@ if (Test-Path -LiteralPath $script:VenvPython -PathType Leaf) {
     } catch {
         Write-Fail ("Could not create virtual environment: {0}" -f $_.Exception.Message)
         Write-Hint 'Verify the Python installation includes venv, then re-run install.ps1.'
+        $installFailed = $true
     }
 }
 
@@ -113,7 +119,12 @@ if (-not (Test-Path -LiteralPath $script:VenvPython -PathType Leaf)) {
                 if ($attempt -lt 3) { Start-Sleep -Seconds 3 }
             }
         }
-        if ($installed) { Write-Ok 'Requirements installed.' } else { Write-Fail 'Requirements could not be installed after 3 attempts.' }
+        if ($installed) {
+            Write-Ok 'Requirements installed.'
+        } else {
+            Write-Fail 'Requirements could not be installed after 3 attempts.'
+            $installFailed = $true
+        }
     }
 }
 
@@ -150,6 +161,7 @@ if (Test-Path -LiteralPath $script:EnvFile -PathType Leaf) {
         Write-Ok 'Created .env from .env.example with a new 48-character API_KEY (value hidden).'
     } catch {
         Write-Fail ("Could not create .env: {0}" -f $_.Exception.Message)
+        $installFailed = $true
     }
 }
 
@@ -192,6 +204,41 @@ if ($SkipDomain) {
         $arguments = '-Domain "{0}"' -f $domainName
         Write-Info 'Run this exact command in an elevated PowerShell window:'
         Write-Host ("    {0}" -f (Get-ElevatedCommand -ScriptName 'setup_domain.ps1' -Arguments $arguments)) -ForegroundColor Yellow
+    }
+}
+
+# The shipped Caddyfile matches the default domain. Regenerate it from the
+# resolved domain so -Domain/LOCAL_DOMAIN also controls the proxy route.
+$caddyContent = (@(
+    '# Local-only HTTP configuration. No public certificate is requested.'
+    '{'
+    "`tauto_https off"
+    "`tadmin off"
+    '}'
+    ''
+    ('http://{0} {{' -f $domainName)
+    "`tbind 127.0.0.1"
+    "`treverse_proxy 127.0.0.1:8080"
+    '}'
+    ''
+) -join "`n")
+$caddyDir = Split-Path -Parent $script:Caddyfile
+if (-not (Test-Path -LiteralPath $caddyDir -PathType Container)) {
+    New-Item -ItemType Directory -Path $caddyDir -Force | Out-Null
+}
+if (-not (Test-Path -LiteralPath $script:Caddyfile -PathType Leaf) -or
+    [System.IO.File]::ReadAllText($script:Caddyfile) -cne $caddyContent) {
+    [System.IO.File]::WriteAllText($script:Caddyfile, $caddyContent, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Ok ("Generated Caddyfile for http://{0}." -f $domainName)
+}
+
+# CORS_ORIGINS is a separate allow-list; the app does not derive it from
+# LOCAL_DOMAIN. Point this out for a custom hostname without editing .env.
+if ($domainName -ine $script:DefaultDomain) {
+    $corsOrigins = Get-ConfigValue -Key 'CORS_ORIGINS'
+    if ($corsOrigins -notmatch [regex]::Escape(('http://{0}' -f $domainName))) {
+        Write-WarnMsg ("Browser clients on http://{0} also need CORS_ORIGINS to include that origin." -f $domainName)
+        Write-Hint 'Add it to CORS_ORIGINS in .env and restart the API.'
     }
 }
 
@@ -243,9 +290,13 @@ if ($SkipAutostart) {
     Write-Step '9/9 Installing autostart tasks'
     try {
         & (Join-Path $script:ScriptsDir 'install_autostart.ps1')
-        if ($LASTEXITCODE -ne 0) { Write-WarnMsg 'Some autostart tasks could not be registered.' }
+        if ($LASTEXITCODE -ne 0) {
+            Write-WarnMsg 'Some autostart tasks could not be registered.'
+            $installFailed = $true
+        }
     } catch {
         Write-WarnMsg ("Autostart installation failed: {0}" -f $_.Exception.Message)
+        $installFailed = $true
     }
 }
 
@@ -258,8 +309,14 @@ if (-not $NoDiagnostics) {
     Write-Step 'Running diagnose.ps1'
     try {
         & (Join-Path $script:ScriptsDir 'diagnose.ps1') | Out-Host
-        if ($LASTEXITCODE -ne 0) { Write-WarnMsg 'Diagnostics reported critical failures; review the suggestions above.' }
-    } catch { Write-WarnMsg ("Diagnostics failed: {0}" -f $_.Exception.Message) }
+        if ($LASTEXITCODE -ne 0) {
+            Write-WarnMsg 'Diagnostics reported critical failures; review the suggestions above.'
+            $installFailed = $true
+        }
+    } catch {
+        Write-WarnMsg ("Diagnostics failed: {0}" -f $_.Exception.Message)
+        $installFailed = $true
+    }
 }
 
 # Final URLs
@@ -275,4 +332,6 @@ Write-Info 'The API key is stored in .env. Never commit or share it.'
 if ($caddyEnabled -and [string]::IsNullOrWhiteSpace($caddyPath)) {
     Write-Hint 'Domain URL requires Caddy; install it and set CADDY_PATH to enable the proxy.'
 }
+if ($installFailed) { Write-WarnMsg 'Installation finished with one or more failures; review the messages above.' }
+if ($installFailed) { exit 1 }
 exit 0

@@ -62,7 +62,7 @@ $installer = Join-Path $script:ScriptsDir 'install.ps1'
 $installArgs = [System.Collections.Generic.List[string]]::new()
 if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
     $installArgs.Add('-PythonPath')
-    $installArgs.Add(('"{0}"' -f $PythonPath))
+    $installArgs.Add($PythonPath)
 }
 if ($SkipDomain) { $installArgs.Add('-SkipDomain') }
 if ($SkipAutostart) { $installArgs.Add('-SkipAutostart') }
@@ -70,7 +70,7 @@ if ($SkipCaddy) { $installArgs.Add('-SkipCaddy') }
 if ($NoDiagnostics) { $installArgs.Add('-NoDiagnostics') }
 if (-not [string]::IsNullOrWhiteSpace($Domain)) {
     $installArgs.Add('-Domain')
-    $installArgs.Add(('"{0}"' -f $Domain))
+    $installArgs.Add($Domain)
 }
 
 & $installer @installArgs

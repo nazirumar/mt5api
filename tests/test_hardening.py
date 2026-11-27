@@ -86,7 +86,10 @@ def test_clock_auto_detection_ignores_historical_samples(settings):
     )
     clock = BrokerClock(neutral)
 
-    clock.observe(time.time() - 3600)
+    # Samples older than the plausible broker-offset window are historical.
+    # A one-hour-old *fresh* tick can legitimately mean a UTC-1 broker, so the
+    # boundary is now wider while callers avoid passing history records here.
+    clock.observe(time.time() - 2 * 86400)
     assert clock.describe()["auto_detected"] is False
 
     clock.observe(time.time() + 7200)

@@ -56,7 +56,12 @@ class MT5ConnectionManager:
     # ------------------------------------------------------------------ #
     def module(self) -> Any:
         if self._module is None:
-            self._module = importlib.import_module("MetaTrader5")
+            try:
+                self._module = importlib.import_module("MetaTrader5")
+            except ModuleNotFoundError as exc:
+                raise MT5NotInitializedError(
+                    f"MetaTrader5 package is not available: {self._sanitize(str(exc))}"
+                ) from None
         return self._module
 
     def _sanitize(self, message: str) -> str:
@@ -69,8 +74,24 @@ class MT5ConnectionManager:
             error = self.module().last_error()
             if not error:
                 return None
-            if isinstance(error, tuple) and len(error) >= 2:
-                return self._sanitize(f"{error[0]}: {error[1]}")
+
+            # MetaTrader5 reports (0, "OK") after a successful call. Treating
+            # that as an error would poison collector/health diagnostics.
+            def is_success_value(value: Any) -> bool:
+                if value is None:
+                    return True
+                if isinstance(value, (int, float)):
+                    return value == 0
+                return str(value).strip().lower() in {"", "ok", "none", "0", "success"}
+
+            if isinstance(error, tuple):
+                if all(is_success_value(part) for part in error):
+                    return None
+                code = error[0] if error else None
+                message = error[1] if len(error) > 1 else None
+                return self._sanitize(f"{code}: {message}")
+            if is_success_value(error):
+                return None
             return self._sanitize(str(error))
         except Exception:  # pragma: no cover - defensive
             return None
@@ -111,7 +132,11 @@ class MT5ConnectionManager:
     def initialize(self) -> bool:
         """Initialize MT5. Credentials are optional when terminal is logged in."""
         with self._lock:
+            if self._initialized:
+                return True
             mod = self.module()
+            # A previous failed attempt must not leak into a fresh startup.
+            self._last_error = None
             path = self.ensure_terminal_running()
             kwargs: dict[str, Any] = {
                 "path": str(path) if path else "",
@@ -194,9 +219,10 @@ class MT5ConnectionManager:
     async def reconnect_async(self) -> bool:
         """Bounded exponential-backoff reconnect used by the monitor."""
         delay = self.settings.MT5_RECONNECT_INTERVAL
-        for attempt in range(1, self.settings.MT5_MAX_RECONNECT_ATTEMPTS + 1):
+        max_attempts = self.settings.MT5_MAX_RECONNECT_ATTEMPTS
+        for attempt in range(1, max_attempts + 1):
             self._reconnect_attempts = attempt
-            logger.info("MT5 reconnect attempt %d/%d", attempt, self.settings.MT5_MAX_RECONNECT_ATTEMPTS)
+            logger.info("MT5 reconnect attempt %d/%d", attempt, max_attempts)
             await asyncio.to_thread(self.shutdown)
             await asyncio.to_thread(self.ensure_terminal_running)
             if await self.initialize_async():
@@ -207,6 +233,8 @@ class MT5ConnectionManager:
                     self._last_success = _utc_now()
                     logger.info("MT5 reconnected successfully")
                     return True
+            if attempt == max_attempts:
+                break
             await asyncio.sleep(delay)
             delay = min(delay * 2, self.settings.MT5_MAX_RECONNECT_INTERVAL)
         self._last_error = self._last_error or "MT5 reconnect attempts exhausted"
@@ -230,6 +258,8 @@ class MT5ConnectionManager:
             func: Callable[..., Any] | None = getattr(self.module(), name, None)
             if func is None or not callable(func):
                 raise MT5OperationError(f"MetaTrader5 package has no operation '{name}'")
+            # Each attempt must report its own outcome, not a previous failure.
+            self._last_error = None
             try:
                 result = func(*args, **kwargs)
             except Exception as exc:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -30,6 +31,19 @@ def _freshness(ctx: AppContext) -> tuple[str, str | None]:
     return "unknown", None
 
 
+_PUBLIC_MT5_FIELDS = (
+    "initialized",
+    "terminal_connected",
+    "last_success",
+    "reconnect_attempts",
+)
+
+
+def _public_mt5_health(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Drop terminal, broker and account identifiers from the public status."""
+    return {key: snapshot.get(key) for key in _PUBLIC_MT5_FIELDS}
+
+
 @router.get(
     "/health",
     summary="Service liveness",
@@ -37,7 +51,7 @@ def _freshness(ctx: AppContext) -> tuple[str, str | None]:
 )
 async def health(request: Request) -> dict[str, Any]:
     ctx: AppContext = get_context(request)
-    snapshot = ctx.manager.health()
+    snapshot = await asyncio.to_thread(ctx.manager.health)
     freshness, last_tick = _freshness(ctx)
     degraded = not snapshot.get("initialized") or not snapshot.get("terminal_connected")
     return ok(
@@ -64,7 +78,7 @@ async def health(request: Request) -> dict[str, Any]:
 )
 async def ready(request: Request) -> dict[str, Any]:
     ctx: AppContext = get_context(request)
-    snapshot = ctx.manager.health()
+    snapshot = await asyncio.to_thread(ctx.manager.health)
     freshness, last_tick = _freshness(ctx)
     ready_state = bool(snapshot.get("initialized") and snapshot.get("terminal_connected"))
     return ok(
@@ -95,6 +109,7 @@ async def status(
     verbose: Annotated[bool, Query(description="Include full component snapshots")] = True,
 ) -> dict[str, Any]:
     ctx: AppContext = get_context(request)
+    snapshot = await asyncio.to_thread(ctx.manager.health)
     freshness, _ = _freshness(ctx)
     payload: dict[str, Any] = {
         "api": {
@@ -104,14 +119,14 @@ async def status(
             "started_at": ctx.runtime.start_wall_clock,
             "startup_errors": ctx.runtime.startup_errors,
         },
-        "mt5": ctx.manager.health(),
+        "mt5": _public_mt5_health(snapshot),
         "broker_clock": ctx.clock.describe(),
         "collector": ctx.collector.stats(),
         "monitor": ctx.monitor.stats(),
         "cache": {"symbols": len(ctx.cache.all())},
         "websocket": {
             "clients": ctx.subscriptions.active_count(),
-            "subscriptions": ctx.subscriptions.snapshot(),
+            "subscriptions": [],
         },
         "data_freshness": freshness,
         "configuration": ctx.settings.public_summary(),

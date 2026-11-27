@@ -21,13 +21,23 @@ METAL_TOKENS = ("XAU", "XAG", "XPT", "XPD", "GOLD", "SILVER", "PLATINUM", "PALLA
 INDEX_TOKENS = ("US30", "US500", "NAS", "SPX", "NDX", "DAX", "FTSE", "CAC", "NIKKEI", "HKG", "AUS200", "GER40", "UK100")
 CRYPTO_TOKENS = ("BTC", "ETH", "LTC", "XRP", "SOL", "DOGE")
 
+# Broker-specific suffixes are decoration, not part of the instrument name.
+# They are stripped for classification only; lookups always use the exact
+# broker-native symbol supplied by the caller.
+_SUFFIX_SEPARATORS = (".", "_", "#", "-", "/")
+_BROKER_SUFFIXES = ("PRO", "MINI", "MICRO", "M")
+
 
 def normalize_symbol_name(symbol: str) -> str:
-    """Strip broker suffixes only for classification - never for lookup."""
-    name = symbol.upper()
-    for separator in (".", "_", "#", "-", "/", "m"):
+    """Strip broker suffixes case-insensitively for classification."""
+    name = symbol.strip().upper()
+    for separator in _SUFFIX_SEPARATORS:
         if separator in name:
             name = name.split(separator, 1)[0]
+    for suffix in _BROKER_SUFFIXES:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            name = name[: -len(suffix)]
+            break
     return "".join(ch for ch in name if ch.isalnum())
 
 

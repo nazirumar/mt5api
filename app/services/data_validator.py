@@ -65,7 +65,7 @@ def normalize_ticks(records: Any) -> list[dict[str, Any]]:
     if records is None:
         return []
     result: list[dict[str, Any]] = []
-    seen: set[tuple[int, float, float]] = set()
+    seen: set[tuple[int, float, float, float, int, int]] = set()
     for record in records:
         raw = attr(record, "time_msc", None) or attr(record, "time", None)
         if raw is None:
@@ -73,7 +73,12 @@ def normalize_ticks(records: Any) -> list[dict[str, Any]]:
         msc = as_int(raw)
         bid = as_float(attr(record, "bid", 0))
         ask = as_float(attr(record, "ask", 0))
-        key = (msc, bid, ask)
+        last = as_float(attr(record, "last", 0))
+        volume = as_int(attr(record, "volume", 0))
+        flags = as_int(attr(record, "flags", 0))
+        # MT5 may emit several distinct ticks in one second. Include every
+        # value field so genuine updates sharing a timestamp are not collapsed.
+        key = (msc, bid, ask, last, volume, flags)
         if key in seen:
             continue
         seen.add(key)
@@ -83,9 +88,9 @@ def normalize_ticks(records: Any) -> list[dict[str, Any]]:
                 "epoch_ms": msc if msc > 1e11 else msc * 1000,
                 "bid": bid or None,
                 "ask": ask or None,
-                "last": as_float(attr(record, "last", 0)) or None,
-                "volume": as_int(attr(record, "volume", 0)) or None,
-                "flags": as_int(attr(record, "flags", 0)),
+                "last": last or None,
+                "volume": volume or None,
+                "flags": flags,
             }
         )
     result.sort(key=lambda item: item["epoch_ms"])

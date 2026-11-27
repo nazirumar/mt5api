@@ -41,31 +41,32 @@ def recent_events(
     request_id: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        fetch_limit = min(max(limit * 20, 500), 5000) if request_id else limit
         with session_factory() as session:
-            statement = select(ServiceEvent).order_by(ServiceEvent.timestamp.desc()).limit(fetch_limit)
+            statement = select(ServiceEvent).order_by(ServiceEvent.timestamp.desc()).limit(limit)
             if kind:
                 statement = statement.where(ServiceEvent.kind == kind)
             if level:
                 statement = statement.where(ServiceEvent.level == level.upper())
+            if request_id:
+                request_key = ServiceEvent.details["request_id"]
+                # SQLAlchemy 2.1 renamed JSON comparator "astext" to
+                # "as_string()"; support both without post-filtering in Python.
+                as_text = getattr(request_key, "astext", None)
+                request_expr = as_text if as_text is not None else request_key.as_string()
+                if callable(request_expr):
+                    request_expr = request_expr()
+                statement = statement.where(request_expr == request_id)
             rows = session.scalars(statement).all()
-            results: list[dict[str, Any]] = []
-            for row in rows:
-                details = row.details or {}
-                if request_id and details.get("request_id") != request_id:
-                    continue
-                results.append(
-                    {
-                        "timestamp": row.timestamp.isoformat(),
-                        "kind": row.kind,
-                        "level": row.level,
-                        "message": row.message,
-                        "details": details,
-                    }
-                )
-                if len(results) >= limit:
-                    break
-            return results
+            return [
+                {
+                    "timestamp": row.timestamp.isoformat(),
+                    "kind": row.kind,
+                    "level": row.level,
+                    "message": row.message,
+                    "details": row.details or {},
+                }
+                for row in rows
+            ]
     except Exception:  # pragma: no cover
         return []
 

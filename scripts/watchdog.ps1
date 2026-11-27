@@ -143,20 +143,45 @@ if ($terminalProcesses.Count -eq 0 -and (Get-ConfigBool -Key 'MT5_START_TERMINAL
     }
 }
 
+# A terminal started above can change the API's health before the repair
+# decision is made. Refresh it so a stale pre-repair reading cannot force an
+# immediate API restart.
+if ($terminalStarted) {
+    $health = Invoke-ApiHealth -Port $effectivePort -TimeoutSec 3
+    $result.ApiReachable = [bool]$health.Reachable
+    $result.ApiStatus = [string]$health.Status
+    $result.TerminalConnected = [bool]$health.TerminalConnected
+    $result.DataFreshness = [string]$health.DataFreshness
+}
+
 if (-not $health.Reachable) {
     if (Test-PortListening -Port $effectivePort) {
-        $code = Invoke-RepairScript -Name 'restart_api.ps1' -Arguments @{ Port = $effectivePort; WaitSeconds = $WaitSeconds }
-        $result.Action = 'api-restarted'
+        # A listener is present, so this is a restart: respect the same
+        # cooldown used for the reachable-but-unhealthy branch.
+        if (Test-RestartAllowed) {
+            $code = Invoke-RepairScript -Name 'restart_api.ps1' -Arguments @{ Port = $effectivePort; WaitSeconds = $WaitSeconds }
+            if ($code -eq 0) {
+                $result.Action = 'api-restarted'
+                $result.ApiRestarted = $true
+                Set-WatchdogRestarted
+                Write-AutostartLog ("Watchdog {0}." -f $result.Action)
+            } else {
+                $result.Error = 'api-repair-failed'
+            }
+        } else {
+            $result.Action = 'waiting-for-reconnect'
+            $result.RestartSkipped = $true
+        }
     } else {
         $code = Invoke-RepairScript -Name 'start_api.ps1' -Arguments @{ Port = $effectivePort; WaitSeconds = $WaitSeconds }
-        $result.Action = 'api-started'
-    }
-    if ($code -eq 0) {
-        $result.ApiRestarted = $true
-        Set-WatchdogRestarted
-        Write-AutostartLog ("Watchdog {0}." -f $result.Action)
-    } else {
-        $result.Error = 'api-repair-failed'
+        if ($code -eq 0) {
+            $result.Action = 'api-started'
+            $result.ApiRestarted = $true
+            Set-WatchdogRestarted
+            Write-AutostartLog ("Watchdog {0}." -f $result.Action)
+        } else {
+            $result.Error = 'api-repair-failed'
+        }
     }
 } elseif ($terminalStarted -or -not $health.TerminalConnected) {
     if (@(Get-MT5Processes).Count -gt 0 -and (Test-RestartAllowed)) {

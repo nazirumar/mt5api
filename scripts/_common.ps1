@@ -499,11 +499,19 @@ function Test-PortListening {
 }
 
 function Get-ApiProcesses {
+    param([int]$Port = 0)
+
+    $effectivePort = if ($Port -gt 0) { $Port } else { Get-ApiPort }
+    # Match the port whether the helper used --port 8080, --port=8080 or
+    # -Port 8080, so unrelated uvicorn instances are never included.
+    $portPattern = '(?i)(?:--port[=\s]+|-Port\s+){0}' -f [regex]::Escape([string]$effectivePort)
     try {
         $filter = "Name = 'python.exe' OR Name = 'pythonw.exe'"
         return @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop |
             Where-Object {
-                $_.CommandLine -match 'uvicorn' -and $_.CommandLine -match 'app\.main:app'
+                $_.CommandLine -match 'uvicorn' -and
+                $_.CommandLine -match 'app\.main:app' -and
+                $_.CommandLine -match $portPattern
             })
     } catch {
         return @()

@@ -96,6 +96,10 @@ class Settings(BaseModel):
     LOG_DIR: str = "logs"
     WEBSOCKET_HEARTBEAT_INTERVAL: float = Field(default=30.0, gt=0)
     WEBSOCKET_STALE_TIMEOUT: float = Field(default=90.0, gt=0)
+    WEBSOCKET_CHECK_ORIGIN: bool = True
+    WEBSOCKET_AUTH_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0)
+    WEBSOCKET_MAX_CLIENTS: int = Field(default=100, ge=1, le=10_000)
+    WEBSOCKET_MAX_FRAME_BYTES: int = Field(default=65_536, ge=1, le=10_485_760)
     DISABLE_BACKGROUND: bool = False
 
     @field_validator("CORS_ORIGINS", "WATCHED_SYMBOLS", mode="before")

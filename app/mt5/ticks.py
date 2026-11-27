@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..core.exceptions import InvalidRequestError, SymbolNotFoundError
-from ..core.helpers import attr
 from ..services.data_validator import normalize_ticks
 from .candles import parse_datetime
 from .clock import BrokerClock
@@ -72,12 +71,8 @@ class TickService:
         if records is None:
             records = []
         ticks = normalize_ticks(records)[-count:]
-        broker_times = [
-            attr(record, "time_msc", None) or attr(record, "time", None) for record in records
-        ]
-        broker_times = [int(value) for value in broker_times if value is not None]
-        sample_epoch_ms = max(broker_times) if broker_times else None
-        ticks = self.clock.convert_ticks(ticks, sample_epoch_ms)
+        # Historical samples must never seed the clock; only live ticks do.
+        ticks = self.clock.convert_ticks(ticks)
         return {
             "symbol": symbol,
             "count": len(ticks),

@@ -163,7 +163,10 @@ def is_terminal_process_running(expected_path: Path | None = None) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     lowered = listing.stdout.lower()
-    return any(name in lowered for name in TERMINAL_EXECUTABLES)
+    # MT4 also ships terminal.exe, so a name-only match would misidentify an
+    # MT4 process as a running MT5 terminal. Only the 64-bit MT5 name is safe
+    # when executable paths are unavailable.
+    return "terminal64.exe" in lowered
 
 
 def launch_terminal(path: Path) -> bool:

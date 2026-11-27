@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..core.exceptions import InvalidRequestError, SymbolNotFoundError
-from ..core.helpers import attr
 from ..services.data_validator import normalize_candles
 from .clock import BrokerClock
 from .connection import MT5ConnectionManager
@@ -102,9 +101,11 @@ class CandleService:
                 records = []
             candles = normalize_candles(records, TIMEFRAME_SECONDS[tf])
 
-        broker_times = [int(attr(record, "time", 0)) for record in records]
-        sample_epoch = max(broker_times) if broker_times else None
-        candles = self.clock.convert_candles(candles, TIMEFRAME_SECONDS[tf], sample_epoch)
+        # Do not pass history timestamps to the clock: only live ticks are a
+        # valid reference for broker offset auto-detection.
+        candles = self.clock.convert_candles(
+            candles, TIMEFRAME_SECONDS[tf], timeframe=tf
+        )
 
         return {
             "symbol": symbol,

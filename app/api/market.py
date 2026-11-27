@@ -21,7 +21,10 @@ WINDOWS = {
 
 
 def _in_window(hour: int, start: int, end: int) -> bool:
-    return hour >= start if start < end else hour >= start or hour < end
+    if start < end:
+        return start <= hour < end
+    # Overnight sessions (e.g. Sydney 21:00-06:00) wrap past midnight.
+    return hour >= start or hour < end
 
 
 @router.get("/sessions", summary="Approximate global FX sessions")

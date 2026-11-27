@@ -122,3 +122,84 @@ def test_env_example_documents_rotation_and_limits():
     ):
         assert key in text
     assert "PUBLIC_ENDPOINTS" not in text
+
+
+def test_watchdog_cooldown_blocks_both_restart_paths():
+    text = (SCRIPTS / "watchdog.ps1").read_text(encoding="utf-8-sig")
+    unreachable = text.split("if (-not $health.Reachable) {", 1)[1].split("} elseif (", 1)[0]
+    unhealthy = text.split("} elseif ($terminalStarted", 1)[1]
+
+    assert "Test-RestartAllowed" in unreachable
+    assert "Test-RestartAllowed" in unhealthy
+    assert "$result.RestartSkipped = $true" in unreachable
+    assert unreachable.index("if ($code -eq 0) {") < unreachable.index(
+        "$result.Action = 'api-restarted'"
+    )
+    assert unreachable.index("if ($code -eq 0) {") < unreachable.index(
+        "$result.ApiRestarted = $true"
+    )
+    assert unhealthy.index("if ($code -eq 0) {") < unhealthy.index("$result.Action = 'api-restarted'")
+
+    # Health must be refreshed after a terminal launch before repair decisions.
+    assert "if ($terminalStarted) {" in text
+    assert text.count("Invoke-ApiHealth -Port $effectivePort") >= 2
+
+
+def test_bootstrap_passes_plain_values_to_installer():
+    text = (SCRIPTS / "bootstrap.ps1").read_text(encoding="utf-8-sig")
+    assert "$installArgs.Add($PythonPath)" in text
+    assert "$installArgs.Add($Domain)" in text
+    assert "('\"{0}\"' -f $PythonPath)" not in text
+    assert "('\"{0}\"' -f $Domain)" not in text
+
+
+def test_installer_tracks_failures_and_exits_nonzero():
+    text = (SCRIPTS / "install.ps1").read_text(encoding="utf-8-sig")
+    assert "$installFailed = $false" in text
+    assert text.count("$installFailed = $true") >= 6
+    assert "if ($installFailed) { exit 1 }" in text
+    assert "Write-KV 'Local domain URL'" in text
+    assert text.rstrip().endswith("exit 0")
+
+
+def test_installer_generates_caddyfile_for_resolved_domain():
+    text = (SCRIPTS / "install.ps1").read_text(encoding="utf-8-sig")
+    assert "$caddyContent" in text
+    assert "('http://{0} {{' -f $domainName)" in text
+    assert "`tbind 127.0.0.1" in text
+    assert "reverse_proxy 127.0.0.1:8080" in text
+    assert "auto_https off" in text
+    assert "admin off" in text
+    assert text.index("$domainName =") < text.index("$caddyContent =")
+
+    caddyfile = (ROOT / "caddy" / "Caddyfile").read_text(encoding="utf-8-sig")
+    assert "http://mt5.nazbeen.test {" in caddyfile
+
+
+def test_api_process_helper_filters_by_configured_port():
+    common = (SCRIPTS / "_common.ps1").read_text(encoding="utf-8-sig")
+    helper = common.split("function Get-ApiProcesses {", 1)[1].split("function Get-CaddyProcesses", 1)[0]
+    assert "param([int]$Port = 0)" in helper
+    assert "Get-ApiPort" in helper
+    assert "--port" in helper
+    assert "-Port" in helper
+    assert r"app\.main:app" in helper
+
+    stop = (SCRIPTS / "stop_api.ps1").read_text(encoding="utf-8-sig")
+    start = (SCRIPTS / "start_api.ps1").read_text(encoding="utf-8-sig")
+    assert "Get-ApiProcesses -Port $effectivePort" in stop
+    assert "Get-ApiProcesses -Port $effectivePort" in start
+    assert "graceful" not in stop.lower()
+    assert "Terminat" in stop
+    # Unrelated port owners are still protected.
+    assert "leaving it running" in stop
+
+
+def test_readme_documents_stop_script_and_domain_override():
+    text = (ROOT / "README.md").read_text(encoding="utf-8-sig")
+    assert 'Stop-ScheduledTask -TaskName "NazbeenMT5API"' not in text
+    assert r"scripts\stop_api.ps1" in text
+    assert "~30s" in text
+    assert "120s" in text
+    assert "-Domain" in text
+    assert "CORS_ORIGINS" in text

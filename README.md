@@ -165,7 +165,8 @@ All settings are read from the process environment, with `.env` as a fallback. S
 | `API_KEY` | required in production | Secret for REST and WebSocket clients. |
 | `API_KEY_PREVIOUS` | empty | Previous secret accepted during rotation; clear after clients update. |
 | `API_KEY_HEADER` | `X-API-Key` | REST header name. |
-| `LOCAL_DOMAIN` | `mt5.nazbeen.test` | Friendly hostname used by scripts and Caddy. |
+| `CORS_ORIGINS` | `http://mt5.nazbeen.test,http://127.0.0.1:8080` | Browser origins allowed by CORS; add any custom local domain here as well. |
+| `LOCAL_DOMAIN` | `mt5.nazbeen.test` | Friendly hostname used by scripts and Caddy; override with `-Domain` when installing. |
 | `ENABLE_CADDY` | `true` | Allows proxy discovery/autostart. |
 | `CADDY_PATH` | empty | Full path to `caddy.exe`; otherwise PATH/common installs are checked. |
 | `ALLOW_LAN_ACCESS` | `false` | Set only after a security review. |
@@ -243,6 +244,8 @@ curl.exe -s -H "X-API-Key: $Key" http://127.0.0.1:8080/api/v1/status
 ## Local domain with Caddy
 
 The optional local hostname is `http://mt5.nazbeen.test`. The `.test` suffix is reserved for testing and will not resolve publicly.
+
+To override it, set `LOCAL_DOMAIN` in `.env` before installing, or pass `-Domain your-host.test` to `install.ps1` / `bootstrap.ps1`. The installer regenerates `caddy\Caddyfile` from the resolved domain (still loopback-only). For browser clients, also add `http://<your-domain>` to `CORS_ORIGINS` in `.env` and restart the API: CORS is a separate allow-list and is **not** derived from `LOCAL_DOMAIN`.
 
 ### 1. Install Caddy
 
@@ -471,7 +474,7 @@ const socket = createMarketSocket({
 | Task | Starts | Helper behavior |
 |---|---|---|
 | `NazbeenMT5Terminal` | MT5 terminal from `MT5_PATH` | Starts immediately if not already running |
-| `NazbeenMT5API` | Uvicorn API | Waits ~30s for the terminal, then starts without duplicates |
+| `NazbeenMT5API` | Uvicorn API | Waits ~30s, then up to 120s for the terminal, and starts without duplicates |
 | `NazbeenMT5Proxy` | Caddy | Waits ~45s, starts only if Caddy is available and port 80 is free |
 | `NazbeenMT5Watchdog` | Self-healing check | Every 5 minutes; starts missing API/terminal/proxy, restarts unhealthy API with a cooldown |
 
@@ -487,7 +490,9 @@ Get-ScheduledTask -TaskName "Nazbeen*"
 Get-ScheduledTaskInfo -TaskName "NazbeenMT5API"
 
 Start-ScheduledTask -TaskName "NazbeenMT5API"
-Stop-ScheduledTask -TaskName "NazbeenMT5API"
+
+# Stopping the scheduled task does not terminate the running API process.
+powershell -ExecutionPolicy Bypass -File .\scripts\stop_api.ps1
 
 # Run the self-healing check immediately.
 powershell -ExecutionPolicy Bypass -File .\scripts\watchdog.ps1

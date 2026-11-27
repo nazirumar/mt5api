@@ -17,6 +17,63 @@ from ..mt5.timeframes import normalize_timeframe
 
 router = APIRouter(tags=["websocket"])
 
+_KNOWN_ACTIONS = {
+    "subscribe",
+    "unsubscribe",
+    "subscribe_candles",
+    "unsubscribe_candles",
+    "ping",
+}
+
+
+class _FrameTooLarge(Exception):
+    """An inbound WebSocket frame exceeded WEBSOCKET_MAX_FRAME_BYTES."""
+
+
+def _normalize_origin(value: str) -> str:
+    return value.strip().rstrip("/").lower()
+
+
+def _origin_allowed(websocket: WebSocket, ctx: AppContext) -> bool:
+    """Allow native clients without Origin; check browsers against CORS origins."""
+    if not getattr(ctx.settings, "WEBSOCKET_CHECK_ORIGIN", True):
+        return True
+    origin = websocket.headers.get("origin")
+    if not origin or not origin.strip():
+        return True
+    allowed = {_normalize_origin(str(item)) for item in ctx.settings.CORS_ORIGINS}
+    if "*" in allowed:
+        return True
+    return _normalize_origin(origin) in allowed
+
+
+async def _close_websocket(websocket: WebSocket, code: int, reason: str) -> None:
+    """Best-effort close; a peer may already have closed the socket."""
+    try:
+        await websocket.close(code=code, reason=reason)
+    except (RuntimeError, OSError, WebSocketDisconnect):
+        pass
+
+
+async def _receive_text_capped(websocket: WebSocket, max_bytes: int) -> str:
+    """Receive one frame without letting an oversized frame reach JSON parsing."""
+    message = await websocket.receive()
+    if message["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(message.get("code", 1000), message.get("reason"))
+    if message["type"] != "websocket.receive":
+        raise RuntimeError("Expected ASGI message 'websocket.receive'")
+    text = message.get("text")
+    if text is None:
+        data = message.get("bytes")
+        if data is None:
+            raise RuntimeError("Expected WebSocket frame to contain text or bytes")
+        if len(data) > max_bytes:
+            raise _FrameTooLarge
+        return data.decode("utf-8", errors="replace")
+    if len(text.encode("utf-8")) > max_bytes:
+        raise _FrameTooLarge
+    return text
+
 
 def _supplied_key(websocket: WebSocket, ctx: AppContext) -> str:
     return (
@@ -75,20 +132,47 @@ def _pairs_payload(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
 @router.websocket("/ws/market")
 async def market_stream(websocket: WebSocket) -> None:
     ctx: AppContext = websocket.app.state.context
+
+    if not _origin_allowed(websocket, ctx):
+        await _close_websocket(websocket, 1008, "Forbidden origin")
+        return
+
     supplied = _supplied_key(websocket, ctx)
     if supplied and not is_valid_api_key(supplied, ctx.settings):
-        await websocket.close(code=1008, reason="Unauthorized")
+        await _close_websocket(websocket, 1008, "Unauthorized")
+        return
+
+    if not ctx.subscriptions.has_capacity():
+        await _close_websocket(websocket, 1013, "Server busy")
         return
 
     authenticated = bool(supplied)
     await websocket.accept()
-    client_id = ctx.subscriptions.connect()
+    try:
+        client_id = ctx.subscriptions.connect()
+    except RuntimeError:
+        await _close_websocket(websocket, 1013, "Server busy")
+        return
+    if authenticated:
+        ctx.subscriptions.authenticate(client_id)
+
+    # Only first-message auth has a deadline; query/header auth is immediate.
+    auth_deadline = (
+        None if authenticated
+        else time.monotonic() + ctx.settings.WEBSOCKET_AUTH_TIMEOUT_SECONDS
+    )
+    max_frame_bytes = ctx.settings.WEBSOCKET_MAX_FRAME_BYTES
 
     async def send_error(message: str, code: str = "WS_ERROR") -> None:
+        detail = {"code": code, "message": message}
         await websocket.send_json(
             {
                 "type": "error",
-                "data": {"code": code, "message": message},
+                # Additive top-level fields for shipped clients that do not
+                # look inside `data`; the original envelope is unchanged.
+                "error": detail,
+                "message": message,
+                "data": detail,
                 "timestamp": timestamp_to_iso(time.time()),
             }
         )
@@ -119,32 +203,66 @@ async def market_stream(websocket: WebSocket) -> None:
             }
         )
 
+    heartbeat_interval = ctx.settings.WEBSOCKET_HEARTBEAT_INTERVAL
+    poll_interval = min(heartbeat_interval, 0.25)
+    last_heartbeat = time.monotonic()
+
     async def sender() -> None:
-        while ctx.subscriptions.is_active(client_id):
+        nonlocal last_heartbeat
+        while True:
+            if (
+                not ctx.subscriptions.is_active(client_id)
+                or ctx.subscriptions.is_stale(client_id)
+            ):
+                # A stale registry entry used to leave the socket half-open.
+                await _close_websocket(websocket, 1008, "Stale connection")
+                break
             if not authenticated:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(poll_interval)
                 continue
             queue = ctx.subscriptions.queue_for(client_id)
             if queue is None:
+                await _close_websocket(websocket, 1008, "Client disconnected")
                 break
             try:
-                message = await asyncio.wait_for(
-                    queue.get(), timeout=ctx.settings.WEBSOCKET_HEARTBEAT_INTERVAL
-                )
+                message = await asyncio.wait_for(queue.get(), timeout=poll_interval)
             except asyncio.TimeoutError:
+                if time.monotonic() - last_heartbeat < heartbeat_interval:
+                    continue
                 message = {"type": "heartbeat", "timestamp": timestamp_to_iso(time.time())}
-            if not ctx.subscriptions.is_active(client_id) or ctx.subscriptions.is_stale(client_id):
+                last_heartbeat = time.monotonic()
+            if (
+                not ctx.subscriptions.is_active(client_id)
+                or ctx.subscriptions.is_stale(client_id)
+            ):
+                await _close_websocket(websocket, 1008, "Stale connection")
                 break
             try:
                 await websocket.send_json(message)
             except (WebSocketDisconnect, RuntimeError, OSError):
                 break
 
+    async def receive_frame() -> str:
+        if auth_deadline is None:
+            return await _receive_text_capped(websocket, max_frame_bytes)
+        remaining = auth_deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(
+            _receive_text_capped(websocket, max_frame_bytes), timeout=remaining
+        )
+
     async def receiver() -> None:
-        nonlocal authenticated
+        nonlocal authenticated, auth_deadline
         while True:
-            raw = await websocket.receive_text()
-            ctx.subscriptions.touch(client_id)
+            try:
+                raw = await receive_frame()
+            except asyncio.TimeoutError:
+                await _close_websocket(websocket, 1008, "Authentication timeout")
+                return
+            except _FrameTooLarge:
+                await _close_websocket(websocket, 1009, "Frame too large")
+                return
             try:
                 payload: Any = json.loads(raw)
             except ValueError:
@@ -154,33 +272,49 @@ async def market_stream(websocket: WebSocket) -> None:
                 await send_error("Expected a JSON object", "INVALID_REQUEST")
                 continue
 
-            action = str(payload.get("action", "")).lower()
+            action = str(payload.get("action", "")).strip().lower()
+            if not action:
+                await send_error("An action is required", "INVALID_REQUEST")
+                continue
 
             if not authenticated:
-                if action == "auth":
-                    candidate = str(payload.get("api_key", ""))
-                    if not is_valid_api_key(candidate, ctx.settings):
-                        await send_error("Valid API key required", "UNAUTHORIZED")
-                        await websocket.close(code=1008, reason="Unauthorized")
-                        return
-                    authenticated = True
-                    await websocket.send_json(
-                        {
-                            "type": "authenticated",
-                            "data": {
-                                "message": "Authenticated; you may now subscribe.",
-                                "timestamp": timestamp_to_iso(time.time()),
-                            },
-                        }
-                    )
-                    await send_welcome("first_message")
+                if action != "auth":
+                    await send_error("Authenticate first with action 'auth'", "UNAUTHORIZED")
                     continue
-                await send_error("Authenticate first with action 'auth'", "UNAUTHORIZED")
+                candidate = str(payload.get("api_key", ""))
+                if not is_valid_api_key(candidate, ctx.settings):
+                    await send_error("Valid API key required", "UNAUTHORIZED")
+                    await _close_websocket(websocket, 1008, "Unauthorized")
+                    return
+                authenticated = True
+                auth_deadline = None
+                ctx.subscriptions.authenticate(client_id)
+                ctx.subscriptions.touch(client_id)
+                await websocket.send_json(
+                    {
+                        "type": "authenticated",
+                        "data": {
+                            "message": "Authenticated; you may now subscribe.",
+                            "timestamp": timestamp_to_iso(time.time()),
+                        },
+                    }
+                )
+                await send_welcome("first_message")
                 continue
 
             if action == "auth":
                 await send_error("Already authenticated", "ALREADY_AUTHENTICATED")
                 continue
+            if action not in _KNOWN_ACTIONS:
+                await send_error(
+                    "Unknown action; use subscribe, unsubscribe, subscribe_candles, "
+                    "unsubscribe_candles or ping",
+                    "UNKNOWN_ACTION",
+                )
+                continue
+
+            # Only a recognized, non-empty action counts as client activity.
+            ctx.subscriptions.touch(client_id)
 
             symbols = payload.get("symbols") or []
             if not isinstance(symbols, list):
@@ -225,12 +359,6 @@ async def market_stream(websocket: WebSocket) -> None:
                 elif action == "ping":
                     await websocket.send_json(
                         {"type": "pong", "timestamp": timestamp_to_iso(time.time())}
-                    )
-                else:
-                    await send_error(
-                        "Unknown action; use subscribe, unsubscribe, subscribe_candles, "
-                        "unsubscribe_candles or ping",
-                        "UNKNOWN_ACTION",
                     )
             except ServiceError as exc:
                 await send_error(exc.message, exc.code)
