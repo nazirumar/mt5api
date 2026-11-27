@@ -3,7 +3,8 @@
     Removes the user-level NazbeenMT5 logon tasks.
 
 .DESCRIPTION
-    Deletes the NazbeenMT5Terminal, NazbeenMT5API and NazbeenMT5Proxy tasks
+    Deletes the NazbeenMT5Terminal, NazbeenMT5API, NazbeenMT5Proxy and
+    NazbeenMT5Watchdog tasks
     using schtasks.exe /Delete /TN ... /F. Missing tasks are treated as
     success, so the script is safe to run repeatedly. No files or settings are
     removed.
@@ -17,6 +18,9 @@
 .PARAMETER KeepProxy
     Keep the NazbeenMT5Proxy (Caddy) task.
 
+.PARAMETER KeepWatchdog
+    Keep the NazbeenMT5Watchdog task.
+
 .EXAMPLE
     .\scripts\uninstall_autostart.ps1
 
@@ -27,7 +31,8 @@
 param(
     [switch]$KeepTerminal,
     [switch]$KeepApi,
-    [switch]$KeepProxy
+    [switch]$KeepProxy,
+    [switch]$KeepWatchdog
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,6 +60,7 @@ $ok = $true
 if (-not $KeepTerminal) { $ok = (Remove-LogonTask -Name 'NazbeenMT5Terminal') -and $ok }
 if (-not $KeepApi) { $ok = (Remove-LogonTask -Name 'NazbeenMT5API') -and $ok }
 if (-not $KeepProxy) { $ok = (Remove-LogonTask -Name 'NazbeenMT5Proxy') -and $ok }
+if (-not $KeepWatchdog) { $ok = (Remove-LogonTask -Name 'NazbeenMT5Watchdog') -and $ok }
 
 if ($ok) { Write-Ok 'Autostart cleanup complete.' } else { Write-WarnMsg 'Some tasks could not be removed.' }
 exit 0

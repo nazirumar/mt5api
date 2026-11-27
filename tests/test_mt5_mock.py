@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.core.exceptions import MT5NotInitializedError
@@ -28,6 +30,20 @@ def test_initialize_and_safe_call(manager, fake_mt5):
     manager.shutdown()
     assert manager.health()["initialized"] is False
     assert fake_mt5.shutdown_count >= 1
+
+
+def test_reconnect_keeps_executable_path(manager, settings, fake_mt5, tmp_path):
+    executable = tmp_path / "terminal64.exe"
+    executable.write_bytes(b"")
+    object.__setattr__(settings, "MT5_PATH", str(executable))
+    fake_mt5.terminal_info = lambda: SimpleNamespace(
+        connected=True, company="Fake Broker", path=str(tmp_path)
+    )
+
+    assert manager.initialize() is True
+    assert manager._terminal_path == executable
+    assert manager._terminal_path.is_file()
+    manager.shutdown()
 
 
 def test_credentials_never_appear_in_health(manager, settings):

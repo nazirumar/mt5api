@@ -27,6 +27,11 @@ logger = get_logger("nazbeen_mt5.mt5.clock")
 class BrokerClock:
     """Converts broker-native timestamps to real UTC timestamps."""
 
+    # Auto-detection must only learn from fresh live ticks. Historical samples
+    # are valid market data but useless as a clock reference.
+    MAX_OBSERVATION_AGE_SECONDS = 60.0
+    MAX_FUTURE_SKEW_SECONDS = 86400.0
+
     def __init__(self, settings: Any):
         self.settings = settings
         self._zone: ZoneInfo | None = None
@@ -86,11 +91,17 @@ class BrokerClock:
         if getattr(self.settings, "MT5_SERVER_UTC_OFFSET_MINUTES", None) is not None:
             return
         now = time.time()
-        new_window = self._offset_seconds is None or (now - self._observed_at) >= 300
         try:
-            difference = float(broker_epoch_seconds) - now
+            sample_seconds = float(broker_epoch_seconds)
         except (TypeError, ValueError):
             return
+        if (
+            sample_seconds < now - self.MAX_OBSERVATION_AGE_SECONDS
+            or sample_seconds > now + self.MAX_FUTURE_SKEW_SECONDS
+        ):
+            return
+        new_window = self._offset_seconds is None or (now - self._observed_at) >= 300
+        difference = sample_seconds - now
         candidate = int(round(difference / 900.0) * 900)
         if abs(difference) < 675:
             candidate = 0

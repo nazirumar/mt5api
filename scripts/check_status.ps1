@@ -54,6 +54,8 @@ $domainName = Get-Domain
 $resolution = Get-DomainResolution -Domain $domainName -Expected '127.0.0.1'
 $hostsEntry = Test-HostsEntry -Domain $domainName
 $health = Invoke-ApiHealth -Port $effectivePort -TimeoutSec $TimeoutSec
+$watchdogTask = $null
+try { $watchdogTask = Get-ScheduledTask -TaskName 'NazbeenMT5Watchdog' -ErrorAction Stop } catch { }
 $recentErrors = @(Get-RecentLogErrors -Max 5)
 $degraded = (-not $health.Reachable) -or (-not $health.TerminalConnected) -or (-not $mt5Running)
 $connectionClaimed = ($health.Reachable -and $health.TerminalConnected -and $mt5Running)
@@ -97,6 +99,7 @@ if ($Json) {
             degraded          = $degraded
             error             = $health.Error
         }
+        watchdog     = [ordered]@{ present = ($null -ne $watchdogTask) }
         recent_errors = @($recentErrors)
     }
     $payload | ConvertTo-Json -Depth 8
@@ -121,6 +124,7 @@ $rows = @(
     [pscustomobject]@{ Check = 'Domain'; Status = if ($resolution.ExpectedFound) { 'OK' } else { 'WARN' }; Detail = Shorten $(if ($resolution.Addresses.Count -gt 0) { ('{0} -> {1}' -f $domainName, (($resolution.Addresses) -join ', ')) } else { ('{0} unresolved' -f $domainName) }) },
     [pscustomobject]@{ Check = 'Hosts entry'; Status = if ($hostsEntry) { 'OK' } else { 'WARN' }; Detail = Shorten $(if ($hostsEntry) { 'present' } else { 'missing' }) },
     [pscustomobject]@{ Check = 'API health'; Status = if ($health.Reachable -and -not $degraded) { 'OK' } elseif ($health.Reachable) { 'WARN' } else { 'FAIL' }; Detail = Shorten $(if ($health.Reachable) { $health.Detail } else { $health.Error }) },
+    [pscustomobject]@{ Check = 'Watchdog task'; Status = if ($watchdogTask) { 'OK' } else { 'WARN' }; Detail = if ($watchdogTask) { 'NazbeenMT5Watchdog registered' } else { 'not registered - run install_autostart.ps1' } },
     [pscustomobject]@{ Check = 'Recent errors'; Status = if ($recentErrors.Count -eq 0) { 'OK' } else { 'WARN' }; Detail = Shorten $(if ($recentErrors.Count -eq 0) { 'none in logs' } else { ('{0} line(s): {1}' -f $recentErrors.Count, $recentErrors[0]) }) }
 )
 

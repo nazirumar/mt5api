@@ -1,4 +1,4 @@
-"""WebSocket subscription registry with bounded per-client queues."""
+"""WebSocket subscription registry for quotes and completed candles."""
 
 from __future__ import annotations
 
@@ -8,11 +8,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+CandleKey = tuple[str, str]
+
 
 @dataclass
 class Client:
     id: int
     symbols: set[str] = field(default_factory=set)
+    candles: set[CandleKey] = field(default_factory=set)
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=64))
     connected_at: float = field(default_factory=time.monotonic)
     last_seen: float = field(default_factory=time.monotonic)
@@ -53,6 +56,22 @@ class SubscriptionManager:
         client.last_seen = time.monotonic()
         return set(client.symbols)
 
+    def subscribe_candles(self, client_id: int, pairs: list[CandleKey]) -> list[CandleKey]:
+        client = self._clients.get(client_id)
+        if not client:
+            return []
+        client.candles.update(pairs)
+        client.last_seen = time.monotonic()
+        return sorted(client.candles)
+
+    def unsubscribe_candles(self, client_id: int, pairs: list[CandleKey]) -> list[CandleKey]:
+        client = self._clients.get(client_id)
+        if not client:
+            return []
+        client.candles.difference_update(pairs)
+        client.last_seen = time.monotonic()
+        return sorted(client.candles)
+
     def disconnect(self, client_id: int) -> None:
         self._clients.pop(client_id, None)
 
@@ -62,6 +81,9 @@ class SubscriptionManager:
 
     def is_active(self, client_id: int) -> bool:
         return client_id in self._clients
+
+    def active_count(self) -> int:
+        return len(self._clients)
 
     def is_stale(self, client_id: int) -> bool:
         client = self._clients.get(client_id)
@@ -74,16 +96,30 @@ class SubscriptionManager:
         symbols: set[str] = set()
         for client in self._clients.values():
             symbols.update(client.symbols)
+            symbols.update(symbol for symbol, _ in client.candles)
         return sorted(symbols)
 
-    def active_count(self) -> int:
-        return len(self._clients)
+    def candle_targets(self) -> list[CandleKey]:
+        pairs: set[CandleKey] = set()
+        for client in self._clients.values():
+            pairs.update(client.candles)
+        return sorted(pairs)
+
+    def active_candle_pairs(self) -> set[CandleKey]:
+        return {pair for client in self._clients.values() for pair in client.candles}
+
+    def has_candle_subscribers(self, symbol: str, timeframe: str) -> bool:
+        return any((symbol, timeframe) in client.candles for client in self._clients.values())
 
     def snapshot(self) -> list[dict[str, Any]]:
         return [
             {
                 "client_id": client.id,
                 "symbols": sorted(client.symbols),
+                "candles": [
+                    {"symbol": symbol, "timeframe": timeframe}
+                    for symbol, timeframe in sorted(client.candles)
+                ],
                 "connected_seconds": round(time.monotonic() - client.connected_at, 1),
                 "idle_seconds": round(time.monotonic() - client.last_seen, 1),
             }
@@ -93,6 +129,11 @@ class SubscriptionManager:
     def publish(self, symbol: str, message: dict[str, Any]) -> None:
         for client in list(self._clients.values()):
             if symbol in client.symbols:
+                self._enqueue(client, message)
+
+    def publish_candle(self, symbol: str, timeframe: str, message: dict[str, Any]) -> None:
+        for client in list(self._clients.values()):
+            if (symbol, timeframe) in client.candles:
                 self._enqueue(client, message)
 
     def publish_all(self, message: dict[str, Any]) -> None:

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -15,12 +16,13 @@ from . import __version__
 from .api import ok
 from .api.router import api_router, websocket_router
 from .config import Settings, get_settings
+from .core.context import get_request_id, new_request_id, request_id_var
 from .core.exceptions import ServiceError
 from .core.lifecycle import RuntimeState, iso_utc
 from .core.logging import configure_logging, get_logger
 from .database.repositories import record_event, recent_events
 from .database.session import create_database
-from .dependencies import AppContext
+from .dependencies import AppContext, require_api_key
 from .mt5.account import AccountService
 from .mt5.candles import CandleService
 from .mt5.clock import BrokerClock
@@ -29,7 +31,9 @@ from .mt5.quotes import QuoteService
 from .mt5.symbols import SymbolService
 from .mt5.ticks import TickService
 from .services.cache import QuoteCache
+from .services.candle_cache import CandleCache
 from .services.connection_monitor import ConnectionMonitor
+from .services.history_limiter import HistoryLimiter
 from .services.market_collector import MarketCollector
 from .services.subscription_manager import SubscriptionManager
 
@@ -40,7 +44,9 @@ Permanent local market-data service for MetaTrader 5.
 
 ## Authentication
 Protected endpoints require the API key in the `X-API-Key` header.
-WebSocket clients pass `?api_key=<key>` (or the configured header).
+WebSocket clients may authenticate with `?api_key=<key>` (deprecated), the
+configured header, or an `auth` message as the first frame. `/api/v1/health`
+is public; `/api/v1/ready` requires a key.
 
 ## Notes
 - All symbol names are broker-native; no symbol substitution is performed.
@@ -61,13 +67,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         clock = BrokerClock(settings)
         symbols = SymbolService(manager, settings)
         quotes = QuoteService(manager, settings, clock)
+        candles = CandleService(manager, settings, clock)
         cache = QuoteCache()
+        candle_cache = CandleCache()
         subscriptions = SubscriptionManager(
             stale_timeout=settings.WEBSOCKET_STALE_TIMEOUT
         )
+        history_limiter = HistoryLimiter(settings)
         collector = MarketCollector(
-            settings, manager, quotes, symbols, cache, subscriptions,
-            database["session_factory"],
+            settings, manager, quotes, candles, symbols, cache, candle_cache,
+            subscriptions, database["session_factory"],
         )
         monitor = ConnectionMonitor(settings, manager, collector)
         context = AppContext(
@@ -77,13 +86,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             clock=clock,
             symbols=symbols,
             quotes=quotes,
-            candles=CandleService(manager, settings, clock),
+            candles=candles,
             ticks=TickService(manager, settings, clock),
             account=AccountService(manager, settings),
             cache=cache,
+            candle_cache=candle_cache,
             subscriptions=subscriptions,
             collector=collector,
             monitor=monitor,
+            history_limiter=history_limiter,
             database=database,
         )
         app.state.context = context
@@ -129,16 +140,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def request_guards(request: Request, call_next: Any):
-        content_length = request.headers.get("content-length")
-        if content_length and content_length.isdigit() and int(content_length) > 1_048_576:
-            return JSONResponse(
-                status_code=413,
-                content={"success": False, "error": {"code": "PAYLOAD_TOO_LARGE", "message": "Request body too large"}},
-            )
-        response = await call_next(request)
+        request_id = request.headers.get("X-Request-ID", "").strip() or new_request_id()
+        token = request_id_var.set(request_id)
+        request.state.request_id = request_id
+        started = time.monotonic()
+        try:
+            content_length = request.headers.get("content-length")
+            if content_length and content_length.isdigit() and int(content_length) > 1_048_576:
+                response = JSONResponse(
+                    status_code=413,
+                    content={
+                        "success": False,
+                        "error": {
+                            "code": "PAYLOAD_TOO_LARGE",
+                            "message": "Request body too large",
+                        },
+                        "meta": {"request_id": request_id},
+                    },
+                )
+            else:
+                response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Request-ID", request_id)
+        logger.info(
+            "HTTP %s %s -> %s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+        )
         return response
 
     @app.exception_handler(ServiceError)
@@ -148,7 +189,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={
                 "success": False,
                 "error": {"code": exc.code, "message": exc.message, "details": exc.details},
-                "meta": {"timestamp": iso_utc()},
+                "meta": {"timestamp": iso_utc(), "request_id": get_request_id()},
             },
         )
 
@@ -159,6 +200,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={
                 "success": False,
                 "error": {"code": "VALIDATION_ERROR", "message": "Invalid request parameters", "details": exc.errors()},
+                "meta": {"request_id": get_request_id()},
             },
         )
 
@@ -168,7 +210,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             status_code=exc.status_code,
             headers=exc.headers,
-            content={"success": False, "error": detail},
+            content={
+                "success": False,
+                "error": detail,
+                "meta": {"request_id": get_request_id()},
+            },
         )
 
     @app.exception_handler(Exception)
@@ -179,6 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={
                 "success": False,
                 "error": {"code": "INTERNAL_ERROR", "message": "Internal server error"},
+                "meta": {"request_id": get_request_id()},
             },
         )
 
@@ -195,10 +242,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
 
-    @app.get("/api/v1/events", tags=["system"], include_in_schema=False)
-    async def events(limit: int = 20) -> dict[str, Any]:
+    @app.get(
+        "/api/v1/events",
+        tags=["system"],
+        dependencies=[Depends(require_api_key)],
+        summary="Recent service events",
+        description="Authenticated diagnostic events with optional kind/level/request_id filters.",
+    )
+    async def events(
+        limit: Annotated[int, Query(ge=1, le=200)] = 20,
+        kind: Annotated[str | None, Query(description="Exact event kind")] = None,
+        level: Annotated[str | None, Query(description="INFO, WARNING or ERROR")] = None,
+        request_id: Annotated[str | None, Query(description="Correlation ID from X-Request-ID")] = None,
+    ) -> dict[str, Any]:
         context: AppContext = app.state.context
-        return ok(recent_events(context.database["session_factory"], limit=limit))
+        records = recent_events(
+            context.database["session_factory"],
+            limit=limit,
+            kind=kind,
+            level=level,
+            request_id=request_id,
+        )
+        return ok(records, count=len(records))
 
     app.include_router(api_router)
     app.include_router(websocket_router)

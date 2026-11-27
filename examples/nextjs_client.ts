@@ -247,7 +247,7 @@ export async function fetchHealth(): Promise<Health> {
   return apiFetch<Health>("/api/v1/health", { auth: false });
 }
 
-/** Batch quotes. Example: ["XAUUSDm", "EURUSDm"]. */
+/** Batch quotes. Example: ["XAUUSD", "EURUSD"]. */
 export async function fetchQuotes(symbols: string[]): Promise<Quote[]> {
   if (!symbols.length) throw new MT5ApiError("At least one symbol is required.", "INVALID_INPUT");
   return apiFetch<Quote[]>("/api/v1/quotes", {
@@ -277,15 +277,17 @@ function toWebSocketBase(baseUrl: string): string {
   return url.toString().replace(/\/$/, "");
 }
 
-function buildWebSocketUrl(apiKey: string): string {
-  const query = new URLSearchParams({ api_key: apiKey }).toString();
-  return `${toWebSocketBase(getBaseUrl())}/ws/market?${query}`;
+function buildWebSocketUrl(): string {
+  // First-message auth keeps the key out of the URL and proxy logs.
+  return `${toWebSocketBase(getBaseUrl())}/ws/market`;
 }
 
 export interface MarketSocketOptions {
   symbols: string[];
   /** Defaults to NEXT_PUBLIC_API_KEY if omitted. */
   apiKey?: string;
+  /** Optional completed-candle subscriptions. */
+  candles?: Array<{ symbol: string; timeframe: string }>;
   onQuote: (quote: Quote, message: QuoteMessage) => void;
   onStatus: (status: string, message?: MarketSocketMessage) => void;
   onError: (error: Error, message?: MarketSocketMessage) => void;
@@ -301,8 +303,9 @@ export interface MarketSocketHandle {
 /**
  * Create an auto-reconnecting market WebSocket client.
  *
- * Server message types: welcome, subscribed, unsubscribed, quote, connection,
- * heartbeat, pong, error. Quotes arrive inside `data`.
+ * Server message types: auth_required, authenticated, welcome, subscribed,
+ * subscribed_candles, unsubscribed, quote, candle, connection, heartbeat,
+ * pong, error. Payloads arrive inside `data`.
  */
 export function createMarketSocket(options: MarketSocketOptions): MarketSocketHandle {
   const apiKey = options.apiKey || getApiKey();
@@ -315,14 +318,16 @@ export function createMarketSocket(options: MarketSocketOptions): MarketSocketHa
     return { close: () => undefined };
   }
 
-  const url = buildWebSocketUrl(apiKey);
+  const url = buildWebSocketUrl();
   const pingIntervalMs = options.pingIntervalMs ?? 30_000;
   const initialBackoffMs = options.initialBackoffMs ?? 1_000;
   const maxBackoffMs = options.maxBackoffMs ?? 60_000;
 
   let ws: WebSocket | null = null;
   let closedByClient = false;
+  let authenticated = false;
   let subscribed = false;
+  let candleSubscribed = false;
   let reconnectTimer: number | undefined;
   let pingTimer: number | undefined;
   let backoffMs = initialBackoffMs;
@@ -350,6 +355,19 @@ export function createMarketSocket(options: MarketSocketOptions): MarketSocketHa
     }
   };
 
+  const subscribeCandles = (): void => {
+    if (options.candles?.length && send({ action: "subscribe_candles", candles: options.candles })) {
+      candleSubscribed = true;
+    }
+  };
+
+  const unsubscribeCandles = (): void => {
+    if (candleSubscribed && options.candles?.length) {
+      send({ action: "unsubscribe_candles", candles: options.candles });
+      candleSubscribed = false;
+    }
+  };
+
   const unsubscribe = (): void => {
     if (subscribed && send({ action: "unsubscribe", symbols: options.symbols })) {
       subscribed = false;
@@ -358,13 +376,28 @@ export function createMarketSocket(options: MarketSocketOptions): MarketSocketHa
 
   const handleMessage = (message: MarketSocketMessage): void => {
     switch (message.type) {
+      case "auth_required":
+        if (!authenticated) {
+          authenticated = send({ action: "auth", api_key: apiKey });
+          options.onStatus("authenticating", message);
+        }
+        break;
+      case "authenticated":
+        authenticated = true;
+        options.onStatus("authenticated", message);
+        break;
       case "welcome":
         options.onStatus("welcome", message);
         if (!subscribed) subscribe();
+        if (!candleSubscribed) subscribeCandles();
         break;
       case "subscribed":
         subscribed = true;
         options.onStatus("subscribed", message);
+        break;
+      case "subscribed_candles":
+        candleSubscribed = true;
+        options.onStatus("subscribed_candles", message);
         break;
       case "unsubscribed":
         subscribed = false;
@@ -372,6 +405,9 @@ export function createMarketSocket(options: MarketSocketOptions): MarketSocketHa
         break;
       case "quote":
         options.onQuote(message.data, message);
+        break;
+      case "candle":
+        options.onStatus("candle", message);
         break;
       case "connection":
         options.onStatus(message.data?.status || "connection", message);
@@ -421,9 +457,10 @@ export function createMarketSocket(options: MarketSocketOptions): MarketSocketHa
 
     ws.onopen = () => {
       backoffMs = initialBackoffMs;
+      authenticated = false;
       subscribed = false;
+      candleSubscribed = false;
       options.onStatus("connected");
-      subscribe();
 
       if (pingTimer !== undefined) window.clearInterval(pingTimer);
       pingTimer = window.setInterval(() => {
@@ -467,6 +504,7 @@ export function createMarketSocket(options: MarketSocketOptions): MarketSocketHa
       closedByClient = true;
       clearTimers();
       unsubscribe();
+      unsubscribeCandles();
       if (ws) {
         ws.close(1000, "client shutdown");
         ws = null;
@@ -487,7 +525,7 @@ export function createMarketSocket(options: MarketSocketOptions): MarketSocketHa
  *
  *   useEffect(() => {
  *     const socket = createMarketSocket({
- *       symbols: ["XAUUSDm", "EURUSDm"],
+ *       symbols: ["XAUUSD", "EURUSD"],
  *       onQuote: (quote) =>
  *         setQuotes((current) => [quote, ...current].slice(0, 50)),
  *       onStatus: (status) => console.log("market socket:", status),

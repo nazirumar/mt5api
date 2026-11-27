@@ -1,4 +1,4 @@
-"""One shared quote polling loop for REST cache and all WebSocket clients."""
+"""One shared quote/candle polling loop for REST cache and WebSocket clients."""
 
 from __future__ import annotations
 
@@ -9,10 +9,13 @@ from typing import Any
 from ..core.helpers import timestamp_to_iso
 from ..core.logging import get_logger
 from ..database.repositories import record_collector_stat, record_event
+from ..mt5.candles import CandleService
 from ..mt5.connection import MT5ConnectionManager
 from ..mt5.quotes import QuoteService
 from ..mt5.symbols import SymbolService
+from ..mt5.timeframes import TIMEFRAME_SECONDS
 from .cache import QuoteCache
+from .candle_cache import CandleCache
 from .subscription_manager import SubscriptionManager
 
 logger = get_logger("nazbeen_mt5.services.collector")
@@ -24,16 +27,20 @@ class MarketCollector:
         settings: Any,
         manager: MT5ConnectionManager,
         quote_service: QuoteService,
+        candle_service: CandleService,
         symbol_service: SymbolService,
         cache: QuoteCache,
+        candle_cache: CandleCache,
         subscriptions: SubscriptionManager,
         session_factory: Any,
     ):
         self.settings = settings
         self.manager = manager
         self.quote_service = quote_service
+        self.candle_service = candle_service
         self.symbol_service = symbol_service
         self.cache = cache
+        self.candle_cache = candle_cache
         self.subscriptions = subscriptions
         self.session_factory = session_factory
         self._task: asyncio.Task | None = None
@@ -42,6 +49,8 @@ class MarketCollector:
         self._last_poll_at: str | None = None
         self._last_error: str | None = None
         self._last_latency_ms = 0.0
+        self._last_candle_bucket: dict[tuple[str, str], int] = {}
+        self._candle_events = 0
 
     @property
     def running(self) -> bool:
@@ -55,6 +64,8 @@ class MarketCollector:
             "last_latency_ms": round(self._last_latency_ms, 2),
             "last_error": self._last_error,
             "default_symbols": list(self._default_symbols),
+            "candle_events": self._candle_events,
+            "candle_pairs": len(self._last_candle_bucket),
         }
 
     async def start(self) -> None:
@@ -100,37 +111,85 @@ class MarketCollector:
             self._default_symbols = []
         return self._default_symbols
 
+    async def _poll_quotes(self) -> None:
+        subscribed = self.subscriptions.target_symbols()
+        defaults = [] if subscribed else await self._discover_default_symbols()
+        symbols = (subscribed or defaults)[:30]
+        if not symbols:
+            return
+        quotes = await asyncio.to_thread(self.quote_service.get_quotes, symbols)
+        errors = 0
+        for quote in quotes:
+            if quote.get("status") != "ok":
+                errors += 1
+            self.cache.set(quote)
+            if self.subscriptions.has_subscribers(quote["symbol"]):
+                self.subscriptions.publish(
+                    quote["symbol"], {"type": "quote", "data": quote}
+                )
+        if not errors:
+            self.manager.mark_success()
+        if self._poll_count % 120 == 1:
+            record_collector_stat(
+                self.session_factory, len(symbols), self._last_latency_ms, errors
+            )
+
+    async def _poll_candles(self) -> None:
+        if not getattr(self.settings, "CANDLE_STREAM_ENABLED", True):
+            return
+        pairs = self.subscriptions.candle_targets()
+        active = set(pairs)
+        for key in list(self._last_candle_bucket):
+            if key not in active:
+                self._last_candle_bucket.pop(key, None)
+                self.candle_cache.remove(*key)
+        now = time.time()
+        for symbol, timeframe in pairs:
+            seconds = TIMEFRAME_SECONDS.get(timeframe)
+            if not seconds:
+                continue
+            bucket = int(now // seconds)
+            if self._last_candle_bucket.get((symbol, timeframe)) == bucket:
+                continue
+            try:
+                result = await asyncio.to_thread(
+                    self.candle_service.get_candles, symbol, timeframe, 2
+                )
+                completed = [item for item in result["candles"] if item.get("completed")]
+                if not completed:
+                    continue
+                candle = max(completed, key=lambda item: item.get("epoch", 0))
+                self._last_candle_bucket[(symbol, timeframe)] = bucket
+                self.candle_cache.set(symbol, timeframe, candle)
+                self._candle_events += 1
+                self.subscriptions.publish_candle(
+                    symbol,
+                    timeframe,
+                    {
+                        "type": "candle",
+                        "data": {
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "candle": candle,
+                        },
+                    },
+                )
+            except Exception as exc:
+                logger.debug("Candle stream poll failed for %s/%s: %s", symbol, timeframe, exc)
+
     async def _run(self) -> None:
         logger.info("Market collector started (interval=%ss)", self.settings.MARKET_POLL_INTERVAL)
         while True:
             started = time.monotonic()
             try:
-                subscribed = self.subscriptions.target_symbols()
-                defaults = [] if subscribed else await self._discover_default_symbols()
-                symbols = (subscribed or defaults)[:30]
-                if symbols:
-                    quotes = await asyncio.to_thread(self.quote_service.get_quotes, symbols)
-                    errors = 0
-                    for quote in quotes:
-                        if quote.get("status") != "ok":
-                            errors += 1
-                        self.cache.set(quote)
-                        if self.subscriptions.has_subscribers(quote["symbol"]):
-                            self.subscriptions.publish(
-                                quote["symbol"], {"type": "quote", "data": quote}
-                            )
-                    if not errors:
-                        self.manager.mark_success()
-                    self._poll_count += 1
-                    self._last_poll_at = timestamp_to_iso(time.time())
-                    self._last_error = None
-                    if self._poll_count % 120 == 1:
-                        record_collector_stat(
-                            self.session_factory, len(symbols), self._last_latency_ms, errors
-                        )
-                    if self._poll_count % 60 == 0:
-                        for client_id in self.subscriptions.cleanup_stale():
-                            logger.info("Removed stale WebSocket client %s", client_id)
+                await self._poll_quotes()
+                self._poll_count += 1
+                self._last_poll_at = timestamp_to_iso(time.time())
+                self._last_error = None
+                await self._poll_candles()
+                if self._poll_count % 60 == 0:
+                    for client_id in self.subscriptions.cleanup_stale():
+                        logger.info("Removed stale WebSocket client %s", client_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -19,7 +19,12 @@ from typing import Any, Callable
 from ..config import Settings
 from ..core.exceptions import MT5NotInitializedError, MT5OperationError
 from ..core.logging import get_logger
-from .terminal import discover_terminal_path, is_terminal_process_running, launch_terminal
+from .terminal import (
+    TERMINAL_EXECUTABLES,
+    discover_terminal_path,
+    is_terminal_process_running,
+    launch_terminal,
+)
 
 logger = get_logger("nazbeen_mt5.mt5.connection")
 
@@ -149,9 +154,16 @@ class MT5ConnectionManager:
             if terminal_info is not None:
                 self._terminal_connected = bool(getattr(terminal_info, "connected", False))
                 self._broker = getattr(terminal_info, "company", None) or self._broker
+                # terminal_info().path is usually the install directory, not
+                # the executable. Keep the discovered executable so reconnects
+                # do not initialize MT5 with a directory path.
                 path_value = getattr(terminal_info, "path", None)
                 if path_value:
-                    self._terminal_path = Path(path_value)
+                    candidate = Path(path_value)
+                    if candidate.is_file() and candidate.name.lower() in TERMINAL_EXECUTABLES:
+                        self._terminal_path = candidate
+                    elif self._terminal_path is None:
+                        self._terminal_path = discover_terminal_path(self.settings)
         except Exception as exc:
             self._terminal_connected = False
             logger.debug("Could not read terminal info: %s", self._sanitize(str(exc)))

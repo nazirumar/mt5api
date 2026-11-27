@@ -6,8 +6,9 @@
     Checks Python, the virtual environment, installed packages, MT5 executable
     discovery (terminal64.exe and terminal.exe), terminal process, MetaTrader5
     import, API process, ports 8080/80, Caddy executable/service/task, domain
-    resolution, hosts entry, HTTP health and docs responses, and prints a
-    firewall note. Every check reports PASS/WARN/FAIL plus a suggested fix.
+    resolution, hosts entry, HTTP health and docs responses, watchdog task,
+    and a firewall note. Every check reports PASS/WARN/FAIL plus a suggested
+    fix.
     A live MT5 connection is never claimed unless a terminal process is
     running AND the API reports terminal_connected=true.
 
@@ -236,10 +237,20 @@ try {
     Add-Check -Name 'Docs endpoint' -Status 'PASS' -Detail ("HTTP {0} from /docs" -f [int]$docs.StatusCode)
 } catch {
     Add-Check -Name 'Docs endpoint' -Status 'WARN' -Detail ("Docs request failed: {0}" -f $_.Exception.Message) `
-        -Fix 'Confirm the API is running and that /docs is in PUBLIC_ENDPOINTS.'
+        -Fix 'Confirm the API is running; /docs is a built-in public route.'
 }
 
-# 15. Firewall note
+# 15. Watchdog task
+$watchdogTask = $null
+try { $watchdogTask = Get-ScheduledTask -TaskName 'NazbeenMT5Watchdog' -ErrorAction Stop } catch { }
+if ($watchdogTask) {
+    Add-Check -Name 'Watchdog task' -Status 'PASS' -Detail 'NazbeenMT5Watchdog registered (every 5 minutes).'
+} else {
+    Add-Check -Name 'Watchdog task' -Status 'WARN' -Detail 'NazbeenMT5Watchdog is not registered.' `
+        -Fix 'Run .\scripts\install_autostart.ps1 (or install.ps1) to register the watchdog.'
+}
+
+# 16. Firewall note
 Add-Check -Name 'Firewall note' -Status 'INFO' `
     -Detail ("API binds {0}:{1} locally; no inbound rule is needed. LAN access requires ALLOW_LAN_ACCESS=true plus an administrator-created firewall rule." -f `
         (Get-ConfigValue -Key 'API_HOST' -Default '127.0.0.1'), $effectivePort)

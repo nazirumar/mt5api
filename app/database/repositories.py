@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import delete, select
 
+from ..core.context import get_request_id
 from .models import CollectorStat, ServiceEvent, SymbolMetadata
 
 
@@ -19,32 +20,52 @@ def record_event(
     details: dict | None = None,
 ) -> None:
     try:
+        enriched = dict(details or {})
+        request_id = get_request_id()
+        if request_id:
+            enriched["request_id"] = request_id
         with session_factory() as session:
             session.add(
-                ServiceEvent(kind=kind, level=level, message=message[:1000], details=details)
+                ServiceEvent(kind=kind, level=level, message=message[:1000], details=enriched)
             )
             session.commit()
     except Exception:  # pragma: no cover - diagnostics must never break the API
         pass
 
 
-def recent_events(session_factory: Any, limit: int = 50, kind: str | None = None) -> list[dict[str, Any]]:
+def recent_events(
+    session_factory: Any,
+    limit: int = 50,
+    kind: str | None = None,
+    level: str | None = None,
+    request_id: str | None = None,
+) -> list[dict[str, Any]]:
     try:
+        fetch_limit = min(max(limit * 20, 500), 5000) if request_id else limit
         with session_factory() as session:
-            statement = select(ServiceEvent).order_by(ServiceEvent.timestamp.desc()).limit(limit)
+            statement = select(ServiceEvent).order_by(ServiceEvent.timestamp.desc()).limit(fetch_limit)
             if kind:
                 statement = statement.where(ServiceEvent.kind == kind)
+            if level:
+                statement = statement.where(ServiceEvent.level == level.upper())
             rows = session.scalars(statement).all()
-            return [
-                {
-                    "timestamp": row.timestamp.isoformat(),
-                    "kind": row.kind,
-                    "level": row.level,
-                    "message": row.message,
-                    "details": row.details,
-                }
-                for row in rows
-            ]
+            results: list[dict[str, Any]] = []
+            for row in rows:
+                details = row.details or {}
+                if request_id and details.get("request_id") != request_id:
+                    continue
+                results.append(
+                    {
+                        "timestamp": row.timestamp.isoformat(),
+                        "kind": row.kind,
+                        "level": row.level,
+                        "message": row.message,
+                        "details": details,
+                    }
+                )
+                if len(results) >= limit:
+                    break
+            return results
     except Exception:  # pragma: no cover
         return []
 

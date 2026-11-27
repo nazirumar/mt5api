@@ -26,5 +26,7 @@ async def get_ticks(
     limit: Annotated[int | None, Query(ge=1)] = None,
 ) -> dict[str, Any]:
     ctx: AppContext = get_context(request)
-    result = await asyncio.to_thread(ctx.ticks.get_ticks, symbol, start, end, limit)
+    slot = await ctx.history_limiter.acquire(request)
+    async with slot:
+        result = await asyncio.to_thread(ctx.ticks.get_ticks, symbol, start, end, limit)
     return ok(result)

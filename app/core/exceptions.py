@@ -53,3 +53,8 @@ class InvalidRequestError(ServiceError):
 class DataValidationError(ServiceError):
     code = "DATA_VALIDATION_FAILED"
     status_code = 502
+
+
+class RateLimitError(ServiceError):
+    code = "RATE_LIMITED"
+    status_code = 429

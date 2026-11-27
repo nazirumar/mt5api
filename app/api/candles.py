@@ -30,5 +30,7 @@ async def get_candles(
     end: Annotated[str | None, Query(description="ISO-8601 UTC")] = None,
 ) -> dict[str, Any]:
     ctx: AppContext = get_context(request)
-    result = await asyncio.to_thread(ctx.candles.get_candles, symbol, timeframe, limit, start, end)
+    slot = await ctx.history_limiter.acquire(request)
+    async with slot:
+        result = await asyncio.to_thread(ctx.candles.get_candles, symbol, timeframe, limit, start, end)
     return ok(result)

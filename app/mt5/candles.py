@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..core.exceptions import InvalidRequestError, SymbolNotFoundError
@@ -33,6 +33,21 @@ class CandleService:
         self.manager = manager
         self.settings = settings
         self.clock = clock or BrokerClock(settings)
+        self._selected_symbols: set[str] = set()
+
+    def _ensure_selected(self, symbol: str) -> None:
+        """Make a broker symbol available to history calls without renaming it."""
+        if symbol in self._selected_symbols:
+            return
+        try:
+            selected = self.manager.call(
+                "symbol_select", symbol, True, allow_none=True, check_result=False
+            )
+            if selected:
+                self._selected_symbols.add(symbol)
+        except Exception:
+            # Selection is best-effort; the subsequent copy call reports real errors.
+            pass
 
     def get_candles(
         self,
@@ -52,11 +67,21 @@ class CandleService:
         info = self.manager.call("symbol_info", symbol, allow_none=True)
         if info is None:
             raise SymbolNotFoundError(f"Symbol '{symbol}' was not found on this broker")
+        self._ensure_selected(symbol)
 
         start_dt = parse_datetime(start, "start")
         end_dt = parse_datetime(end, "end")
-        if start_dt and end_dt and end_dt <= start_dt:
+        max_days = int(getattr(self.settings, "MAX_CANDLE_RANGE_DAYS", 365))
+        if end_dt and not start_dt:
+            start_dt = end_dt - timedelta(days=max_days)
+        effective_end = end_dt or datetime.now(timezone.utc)
+        if start_dt and effective_end <= start_dt:
             raise InvalidRequestError("end must be later than start")
+        if start_dt and (effective_end - start_dt).days > max_days:
+            raise InvalidRequestError(
+                f"Candle range exceeds MAX_CANDLE_RANGE_DAYS ({max_days})",
+                details={"max_days": max_days},
+            )
 
         if start_dt or end_dt:
             # MT5 range arguments are broker server time, so convert the API's
@@ -66,7 +91,7 @@ class CandleService:
             from_dt = self.clock.to_broker_datetime(
                 start_dt or datetime.fromtimestamp(0, tz=timezone.utc)
             )
-            to_dt = self.clock.to_broker_datetime(end_dt or datetime.now(timezone.utc))
+            to_dt = self.clock.to_broker_datetime(effective_end)
             records = self.manager.call("copy_rates_range", symbol, mt5_tf, from_dt, to_dt, allow_none=True)
             if records is None:
                 records = []

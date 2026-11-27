@@ -106,11 +106,3 @@ class SymbolService:
                 details={"suggestions": [item["symbol"] for item in similar]},
             )
         return self.symbol_info(info)
-
-    def ensure_selected(self, symbol: str) -> bool:
-        """Make a symbol available to tick/copy calls without substituting it."""
-        info = self.manager.call("symbol_info", symbol, allow_none=True)
-        if info is None:
-            raise SymbolNotFoundError(f"Symbol '{symbol}' was not found on this broker")
-        selected = self.manager.call("symbol_select", symbol, True)
-        return bool(selected)

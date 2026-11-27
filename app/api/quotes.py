@@ -27,7 +27,8 @@ async def get_quotes(
         requested = [item.strip() for item in symbols.split(",") if item.strip()]
         quotes = await asyncio.to_thread(ctx.quotes.get_quotes, requested)
     else:
-        cached = ctx.cache.all()
+        window = ctx.settings.MARKET_POLL_INTERVAL * ctx.settings.QUOTE_STALE_MULTIPLIER
+        cached = ctx.cache.all_fresh(window)
         quotes = list(cached.values()) if cached else []
     return ok(quotes, count=len(quotes), poll_interval=ctx.settings.MARKET_POLL_INTERVAL)
 

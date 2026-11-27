@@ -7,7 +7,9 @@ Install:
 Environment:
     API_BASE_URL     Default: http://mt5.nazbeen.test
     API_KEY      Required (MT5_API_KEY accepted as a compatibility fallback)
-    MT5_WS_SYMBOLS   Optional, default: XAUUSDm,EURUSDm
+    MT5_WS_SYMBOLS   Optional, default: XAUUSD,EURUSD
+    MT5_WS_CANDLES   Optional, comma-separated SYMBOL:TIMEFRAME pairs, e.g.
+                     XAUUSD:M1,EURUSD:M5
 
 Read-only: subscribes to quotes only. It never sends trading commands.
 """
@@ -21,7 +23,6 @@ import signal
 import sys
 import time
 from typing import Any
-from urllib.parse import urlencode
 
 try:
     import websockets
@@ -35,7 +36,7 @@ except ImportError:  # pragma: no cover
 
 
 DEFAULT_BASE_URL = "http://mt5.nazbeen.test"
-DEFAULT_SYMBOLS = ("XAUUSDm", "EURUSDm")
+DEFAULT_SYMBOLS = ("XAUUSD", "EURUSD")
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 60.0
 PING_AFTER_IDLE_SECONDS = 30.0
@@ -47,8 +48,12 @@ class ConfigurationError(Exception):
     """Raised when required local configuration is missing."""
 
 
-def build_ws_url(base_url: str, api_key: str) -> str:
-    """Convert an HTTP base URL to the market WebSocket URL."""
+def build_ws_url(base_url: str) -> str:
+    """Convert an HTTP base URL to the market WebSocket URL.
+
+    Authentication is sent as the first frame, so the API key stays out of the
+    URL and proxy logs. Query-string auth remains supported for older clients.
+    """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://") :]
@@ -58,8 +63,7 @@ def build_ws_url(base_url: str, api_key: str) -> str:
         ws_base = base
     else:
         ws_base = "ws://" + base
-    query = urlencode({"api_key": api_key})
-    return f"{ws_base}/ws/market?{query}"
+    return f"{ws_base}/ws/market"
 
 
 def compact_json(value: Any) -> str:
@@ -69,12 +73,22 @@ def compact_json(value: Any) -> str:
 class MarketWebSocketClient:
     """Auto-reconnecting, read-only quote stream client."""
 
-    def __init__(self, url: str, symbols: list[str]) -> None:
+    def __init__(
+        self,
+        url: str,
+        symbols: list[str],
+        api_key: str,
+        candles: list[dict[str, str]] | None = None,
+    ) -> None:
         self.url = url
         self.symbols = symbols
+        self.api_key = api_key
+        self.candles = candles or []
         self.stop_event = asyncio.Event()
         self.last_message_at = time.monotonic()
+        self.authenticated_sent = False
         self.subscribed_sent = False
+        self.candles_sent = False
         self._ws: Any = None
 
     def request_stop(self) -> None:
@@ -109,7 +123,9 @@ class MarketWebSocketClient:
                 async with websockets.connect(self.url, ping_interval=None) as ws:
                     self._ws = ws
                     self.last_message_at = time.monotonic()
+                    self.authenticated_sent = False
                     self.subscribed_sent = False
+                    self.candles_sent = False
                     backoff = INITIAL_BACKOFF_SECONDS
                     print("Connected.")
 
@@ -167,7 +183,16 @@ class MarketWebSocketClient:
         msg_type = str(message.get("type", "unknown"))
         data = message.get("data")
 
-        if msg_type == "welcome":
+        if msg_type == "auth_required":
+            if not self.authenticated_sent:
+                await self._send_json(ws, {"action": "auth", "api_key": self.api_key})
+                self.authenticated_sent = True
+                print("Authenticating in the first WebSocket frame.")
+
+        elif msg_type == "authenticated":
+            print("WebSocket authenticated.")
+
+        elif msg_type == "welcome":
             print(f"Welcome: {compact_json(data if data is not None else message)}")
             if not self.subscribed_sent:
                 await self._send_json(
@@ -176,9 +201,22 @@ class MarketWebSocketClient:
                 )
                 self.subscribed_sent = True
                 print(f"Subscribed request sent for: {', '.join(self.symbols)}")
+            if self.candles and not self.candles_sent:
+                await self._send_json(
+                    ws,
+                    {"action": "subscribe_candles", "candles": self.candles},
+                )
+                self.candles_sent = True
+                print("Completed-candle stream subscribed.")
 
         elif msg_type == "subscribed":
             print(f"Subscribed: {compact_json(data if data is not None else message)}")
+
+        elif msg_type == "subscribed_candles":
+            print(f"Candle stream: {compact_json(data if data is not None else message)}")
+
+        elif msg_type == "candle":
+            print(f"Candle closed: {compact_json(data if data is not None else message)}")
 
         elif msg_type == "unsubscribed":
             print(f"Unsubscribed: {compact_json(data if data is not None else message)}")
@@ -249,6 +287,18 @@ class MarketWebSocketClient:
             print("Unsubscribe request sent.")
         except Exception as exc:
             print(f"Unsubscribe skipped: {exc}")
+        if self.candles_sent:
+            try:
+                await asyncio.wait_for(
+                    self._send_json(
+                        ws,
+                        {"action": "unsubscribe_candles", "candles": self.candles},
+                    ),
+                    timeout=2.0,
+                )
+                print("Candle unsubscribe request sent.")
+            except Exception as exc:
+                print(f"Candle unsubscribe skipped: {exc}")
 
 
 async def main() -> int:
@@ -269,7 +319,15 @@ async def main() -> int:
         print("MT5_WS_SYMBOLS is empty.", file=sys.stderr)
         return 2
 
-    client = MarketWebSocketClient(build_ws_url(base_url, api_key), symbols)
+    raw_candles = os.getenv("MT5_WS_CANDLES", "")
+    candles = []
+    for item in raw_candles.split(","):
+        parts = item.strip().split(":")
+        if len(parts) != 2 or not all(parts):
+            continue
+        candles.append({"symbol": parts[0], "timeframe": parts[1]})
+
+    client = MarketWebSocketClient(build_ws_url(base_url), symbols, api_key, candles)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

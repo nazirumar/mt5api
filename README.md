@@ -35,16 +35,21 @@ A **local, read-only** market data API for MetaTrader 5. It exposes REST and Web
 
 ## Features
 
-- **REST + WebSocket** market data over FastAPI.
+- **REST + WebSocket** market data over FastAPI, including a completed-candle stream.
 - **Broker-native symbols only** — no invented tickers or synthetic prices.
 - **UTC-correct timestamps** for quotes, candles, ticks, and history ranges.
 - **Completed vs forming candles** reported explicitly.
 - **Serialized MT5 access** through one re-entrant connection manager.
-- **Shared quote collector** for REST and WebSocket clients.
-- **Private API key** for REST headers and WebSocket query strings.
-- **User-level Windows autostart** with battery-safe Task Scheduler settings.
+- **Shared quote/candle collector** for REST and WebSocket clients.
+- **Private API key** for REST headers and WebSocket first-message auth; query-string auth remains for compatibility.
+- **Zero-downtime key rotation** with `API_KEY_PREVIOUS`.
+- **Request IDs and structured JSON logs** with filterable local events.
+- **Health vs readiness** probes for liveness and authenticated MT5 readiness.
+- **Bounded history** with range caps, rate limiting, and concurrency limits.
+- **User-level Windows autostart** with a 5-minute watchdog and battery-safe Task Scheduler settings.
 - **Optional local domain** via Caddy at `http://mt5.nazbeen.test`.
 - **SQLite-backed diagnostics** and local PowerShell status tools.
+- **Windows CI** on Python 3.12 and 3.13 via GitHub Actions.
 
 ---
 
@@ -59,21 +64,24 @@ Browser / curl / Python / Next.js
                v
       FastAPI on 127.0.0.1:8080
        |          |          |
-       |          |          +--> WebSocket subscriptions
-       |          +-------------> Shared quote collector
+       |          |          +--> WebSocket quotes + completed candles
+       |          +-------------> Shared quote/candle collector
        +-----------------------> Serialized MT5 bridge --> logged-in terminal
                                       |
                                       +--> SQLite diagnostics
+                                      +--> 5-minute watchdog repair task
 ```
 
 | Component | Responsibility |
 |---|---|
-| FastAPI app | HTTP API, WebSocket stream, validation, error envelopes |
+| FastAPI app | HTTP API, WebSocket streams, validation, request IDs, error envelopes |
 | MT5 bridge | One serialized connection manager for all terminal calls |
-| BrokerClock | Converts broker-server time to real UTC |
-| MarketCollector | Polls the active symbol set once for all clients |
+| BrokerClock | Converts broker-server time to real UTC from fresh ticks |
+| MarketCollector | Polls quotes and completed candles once for all clients |
+| HistoryLimiter | Per-client rate limit and global concurrency cap |
 | SQLite | Local operational/diagnostic records |
 | Caddy | Friendly local hostname; no public TLS or exposure |
+| Watchdog | Five-minute self-healing task for API, terminal and proxy |
 
 ---
 
@@ -124,7 +132,19 @@ curl.exe -s http://127.0.0.1:8080/api/v1/health
 curl.exe -s http://127.0.0.1:8080/docs
 ```
 
-For an automated install of dependencies, `.env`, and autostart tasks:
+For a fresh clone, the one-command bootstrap creates the virtual environment, installs requirements, generates `.env`, configures autostart, and prints the URLs:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
+```
+
+To run the tests as part of bootstrap:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 -RunTests
+```
+
+The installer remains available when you want more control:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
@@ -143,6 +163,7 @@ All settings are read from the process environment, with `.env` as a fallback. S
 | `API_HOST` | `127.0.0.1` | Bind address. Keep loopback unless you have reviewed LAN exposure. |
 | `API_PORT` | `8080` | FastAPI port. |
 | `API_KEY` | required in production | Secret for REST and WebSocket clients. |
+| `API_KEY_PREVIOUS` | empty | Previous secret accepted during rotation; clear after clients update. |
 | `API_KEY_HEADER` | `X-API-Key` | REST header name. |
 | `LOCAL_DOMAIN` | `mt5.nazbeen.test` | Friendly hostname used by scripts and Caddy. |
 | `ENABLE_CADDY` | `true` | Allows proxy discovery/autostart. |
@@ -175,6 +196,12 @@ Leave `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER` empty if the terminal is alr
 | `DEFAULT_CANDLE_LIMIT` | `500` | Default candle count. |
 | `MAX_CANDLE_LIMIT` | `5000` | Maximum candle count. |
 | `MAX_TICK_RECORDS` | `10000` | Maximum ticks per request. |
+| `MAX_CANDLE_RANGE_DAYS` | `365` | Maximum `start`/`end` span for candles. |
+| `MAX_TICK_RANGE_DAYS` | `30` | Maximum `start`/`end` span for ticks. |
+| `HISTORY_RATE_LIMIT_PER_MINUTE` | `30` | Per-client history request budget. |
+| `HISTORY_MAX_CONCURRENT` | `2` | Concurrent MT5 history calls. |
+| `CANDLE_STREAM_ENABLED` | `true` | Enables the completed-candle WebSocket stream. |
+| `CANDLE_STREAM_MAX_SUBSCRIPTIONS` | `50` | Maximum candle pairs per WebSocket client message. |
 | `WEBSOCKET_HEARTBEAT_INTERVAL` | `30` | WebSocket ping interval. |
 | `WEBSOCKET_STALE_TIMEOUT` | `90` | Stale client timeout. |
 
@@ -194,7 +221,7 @@ MT5_SERVER_TIMEZONE=Europe/London
 MT5_SERVER_UTC_OFFSET_MINUTES=120
 ```
 
-If both are blank, the API estimates the offset from fresh MT5 ticks and rounds to 15 minutes. For reliable history, set one explicitly.
+If both are blank, the API estimates the offset only from **fresh** MT5 ticks and rounds to 15 minutes. Historical samples are deliberately ignored because their age is not a valid clock reference. For reliable history, set one explicitly.
 
 The clock is applied to:
 
@@ -207,6 +234,7 @@ A broker candle labelled `12:00` at UTC+2 is exported as `10:00Z`. The active cl
 
 ```powershell
 curl.exe -s http://127.0.0.1:8080/api/v1/health
+curl.exe -s -H "X-API-Key: $Key" http://127.0.0.1:8080/api/v1/ready
 curl.exe -s -H "X-API-Key: $Key" http://127.0.0.1:8080/api/v1/status
 ```
 
@@ -272,12 +300,14 @@ Do **not** bind FastAPI or Caddy to `0.0.0.0`, create public DNS records, forwar
 | Client | How to send the key |
 |---|---|
 | REST | `X-API-Key: <key>` |
-| WebSocket | `/ws/market?api_key=<key>` |
-| Health/docs | Public; no key required |
+| WebSocket (preferred) | First frame: `{"action":"auth","api_key":"<key>"}` |
+| WebSocket (compatible) | `/ws/market?api_key=<key>` or configured header |
+| Health, status, docs | Public; no key required |
+| Ready, events | `X-API-Key: <key>` |
 
-The server reads the secret from `API_KEY` in `.env`. Client examples read `API_KEY` and accept `MT5_API_KEY` as a compatibility fallback.
+The server reads the secret from `API_KEY` in `.env`. During rotation, set `API_KEY_PREVIOUS` to the old secret so both keys work; clear it once every client has moved to the new key. Client examples read `API_KEY` and accept `MT5_API_KEY` as a compatibility fallback.
 
-> The WebSocket key is in the URL and can appear in proxy logs. Keep logs local and rotate the key if exposed.
+> First-message WebSocket auth keeps the key out of URLs and proxy logs. The query-string form remains supported only for older clients; rotate the key if it may have been logged.
 
 ---
 
@@ -292,8 +322,10 @@ http://mt5.nazbeen.test          # with Caddy + hosts entry
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| `GET` | `/api/v1/health` | Public | Liveness, MT5 state, freshness, broker clock |
-| `GET` | `/api/v1/status` | Key | Component status, collector, WebSocket, config summary |
+| `GET` | `/api/v1/health` | Public | Liveness, MT5 state, read-time freshness, broker clock |
+| `GET` | `/api/v1/ready` | Key | Authenticated MT5 readiness and component detail |
+| `GET` | `/api/v1/status` | Public | Component status, collector, WebSocket, config summary |
+| `GET` | `/api/v1/events` | Key | Filterable recent diagnostic events |
 | `GET` | `/api/v1/connection` | Key | MT5 connection diagnostics |
 | `GET` | `/api/v1/symbols` | Key | Broker-native symbols |
 | `GET` | `/api/v1/symbols/search?q=EUR` | Key | Search symbols |
@@ -304,10 +336,10 @@ http://mt5.nazbeen.test          # with Caddy + hosts entry
 | `GET` | `/api/v1/candles/{symbol}?timeframe=M5&limit=500` | Key | OHLC candles |
 | `GET` | `/api/v1/ticks/{symbol}?start=2026-01-01T00:00:00Z` | Key | Tick history |
 | `GET` | `/api/v1/account` | Key | Read-only account diagnostics |
-| `WS` | `/ws/market?api_key=<key>` | Key query | Live quote stream |
+| `WS` | `/ws/market` | First message | Live quotes and completed candles |
 | `GET` | `/docs` | Public | Interactive OpenAPI documentation |
 
-Supported timeframe tokens include `M1`, `M5`, `M15`, `M30`, `H1`, `H4`, `D1`, `W1`, and `MN1`.
+Supported timeframe tokens include `M1`, `M5`, `M15`, `M30`, `H1`, `H4`, `D1`, `W1`, and `MN1`. History requests are bounded by `MAX_CANDLE_RANGE_DAYS`, `MAX_TICK_RANGE_DAYS`, `HISTORY_RATE_LIMIT_PER_MINUTE` (HTTP 429), and `HISTORY_MAX_CONCURRENT`.
 
 ### Envelopes
 
@@ -317,7 +349,7 @@ Success:
 {
   "success": true,
   "data": {},
-  "meta": {}
+  "meta": { "request_id": "..." }
 }
 ```
 
@@ -330,29 +362,45 @@ Error:
     "code": "ERROR_CODE",
     "message": "Human-readable explanation",
     "details": {}
-  }
+  },
+  "meta": { "request_id": "..." }
 }
 ```
+
+Every response includes an `X-Request-ID` header. Send your own `X-Request-ID` to correlate client and structured server logs, or let the API generate one. Events can be filtered with `/api/v1/events?request_id=<id>`.
 
 ### WebSocket protocol
 
 ```text
-ws://mt5.nazbeen.test/ws/market?api_key=YOUR_KEY
+ws://mt5.nazbeen.test/ws/market
 ```
 
-Subscribe:
+Authenticate as the first frame:
+
+```json
+{"action":"auth","api_key":"YOUR_KEY"}
+```
+
+Subscribe to quotes:
 
 ```json
 {"action":"subscribe","symbols":["EURUSD","XAUUSD"]}
+```
+
+Subscribe to completed candles (one message per interval close):
+
+```json
+{"action":"subscribe_candles","candles":[{"symbol":"EURUSD","timeframe":"M1"}]}
 ```
 
 Unsubscribe:
 
 ```json
 {"action":"unsubscribe","symbols":["EURUSD"]}
+{"action":"unsubscribe_candles","candles":[{"symbol":"EURUSD","timeframe":"M1"}]}
 ```
 
-Server message types: `welcome`, `subscribed`, `unsubscribed`, `quote`, `connection`, `heartbeat`, `pong`, `error`.
+Server message types: `auth_required`, `authenticated`, `welcome`, `subscribed`, `subscribed_candles`, `unsubscribed`, `quote`, `candle`, `connection`, `heartbeat`, `pong`, `error`.
 
 ### Completed vs forming candles
 
@@ -418,13 +466,14 @@ const socket = createMarketSocket({
 
 ## Windows autostart
 
-`scripts\install.ps1` registers three user-level logon tasks. No administrator rights are required.
+`scripts\install.ps1` registers three user-level logon tasks plus one recurring watchdog task. No administrator rights are required.
 
 | Task | Starts | Helper behavior |
 |---|---|---|
 | `NazbeenMT5Terminal` | MT5 terminal from `MT5_PATH` | Starts immediately if not already running |
 | `NazbeenMT5API` | Uvicorn API | Waits ~30s for the terminal, then starts without duplicates |
 | `NazbeenMT5Proxy` | Caddy | Waits ~45s, starts only if Caddy is available and port 80 is free |
+| `NazbeenMT5Watchdog` | Self-healing check | Every 5 minutes; starts missing API/terminal/proxy, restarts unhealthy API with a cooldown |
 
 All tasks are configured to:
 
@@ -439,6 +488,9 @@ Get-ScheduledTaskInfo -TaskName "NazbeenMT5API"
 
 Start-ScheduledTask -TaskName "NazbeenMT5API"
 Stop-ScheduledTask -TaskName "NazbeenMT5API"
+
+# Run the self-healing check immediately.
+powershell -ExecutionPolicy Bypass -File .\scripts\watchdog.ps1
 ```
 
 To re-register after changing `.env` or the scripts:
@@ -457,7 +509,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\diagnose.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\diagnose.ps1 -Json
 ```
 
-`check_status.ps1` reports Python/venv, MT5 process and connection, API listener, Caddy process/port, domain resolution, hosts entry, health, and recent log errors.
+`check_status.ps1` reports Python/venv, MT5 process and connection, API listener, Caddy process/port, domain resolution, hosts entry, health, and recent log errors. The authenticated `/api/v1/ready` endpoint adds component-level readiness and collector statistics.
 
 `diagnose.ps1` adds actionable PASS/WARN/FAIL rows. A live connection is claimed only when a terminal process exists **and** the API reports `terminal_connected=true`.
 
@@ -479,7 +531,7 @@ Tests use a fake MT5 module; no live broker account is required.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The suite covers REST endpoints, WebSockets, authentication, broker-clock conversion, NumPy structured records, stale quotes, and PowerShell script parsing.
+The suite covers REST endpoints, WebSockets, first-message auth, candle streams, authentication and rotation, request IDs, broker-clock conversion, history bounds, PowerShell script parsing, and CI/bootstrap metadata. GitHub Actions runs the same suite on Windows with Python 3.12 and 3.13.
 
 ---
 
@@ -488,12 +540,13 @@ The suite covers REST endpoints, WebSockets, authentication, broker-clock conver
 ```text
 mt5api/
 ├── app/
-│   ├── api/          # REST routers and WebSocket endpoint
-│   ├── core/         # Security, lifecycle, logging, helpers
+│   ├── api/          # REST routers and WebSocket endpoints
+│   ├── core/         # Security, lifecycle, context, structured logging
 │   ├── database/     # SQLite models and repositories
 │   ├── mt5/          # Connection, symbols, quotes, candles, ticks, clock
 │   ├── schemas/      # Pydantic response models
-│   └── services/     # Collector, cache, subscriptions, monitor
+│   └── services/     # Collector, caches, subscriptions, limiter, monitor
+├── .github/workflows/ci.yml
 ├── caddy/Caddyfile
 ├── data/
 ├── examples/         # Python, Next.js, and WebSocket clients
@@ -510,10 +563,11 @@ mt5api/
 ## Security
 
 - Keep the API bound to loopback.
-- Keep `API_KEY` secret; rotate it if exposed.
+- Keep `API_KEY` secret; rotate it with `API_KEY_PREVIOUS` and clear the old value when clients have updated.
 - Do not commit `.env`, SQLite data, logs, or API keys.
 - Treat browser-facing keys as public; use a server-side proxy.
-- The WebSocket key appears in the URL and may be logged.
+- Prefer WebSocket first-message auth; query-string keys may appear in proxy logs.
+- History endpoints are rate-limited and range-bounded; keep the configured caps unless you have reviewed the load.
 - Account data is sensitive even though the API cannot trade.
 - Do not add public DNS, port forwarding, or TLS without a full review.
 - Run only on a trusted Windows profile; the MT5 terminal holds broker credentials.
@@ -533,7 +587,7 @@ $Project = "C:\path\to\mt5api"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$Project\scripts\remove_domain.ps1" -Domain "mt5.nazbeen.test"
 ```
 
-The uninstall scripts preserve `.env` and source files unless `-DeleteData` is supplied.
+The uninstall scripts preserve `.env` and source files unless `-DeleteData` is supplied. `uninstall_autostart.ps1` also removes `NazbeenMT5Watchdog` unless `-KeepWatchdog` is passed.
 
 ---
 

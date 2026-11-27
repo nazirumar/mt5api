@@ -56,21 +56,13 @@ class Settings(BaseModel):
     API_HOST: str = "127.0.0.1"
     API_PORT: int = Field(default=8080, ge=1, le=65535)
     API_KEY: str = "CHANGE_ME_TO_A_RANDOM_SECRET"
+    API_KEY_PREVIOUS: str = ""
     API_KEY_HEADER: str = "X-API-Key"
 
     LOCAL_DOMAIN: str = "mt5.nazbeen.test"
     ENABLE_CADDY: bool = True
     ALLOW_LAN_ACCESS: bool = False
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://mt5.nazbeen.test", "http://127.0.0.1:8080"])
-    PUBLIC_ENDPOINTS: list[str] = Field(
-        default_factory=lambda: [
-            "/",
-            "/docs",
-            "/redoc",
-            "/openapi.json",
-            "/api/v1/health",
-        ]
-    )
 
     MT5_PATH: str = ""
     MT5_LOGIN: int | None = None
@@ -92,6 +84,12 @@ class Settings(BaseModel):
     DEFAULT_CANDLE_LIMIT: int = Field(default=500, ge=1, le=10000)
     MAX_CANDLE_LIMIT: int = Field(default=5000, ge=1, le=100000)
     MAX_TICK_RECORDS: int = Field(default=10000, ge=1, le=200000)
+    MAX_CANDLE_RANGE_DAYS: int = Field(default=365, ge=1, le=3650)
+    MAX_TICK_RANGE_DAYS: int = Field(default=30, ge=1, le=365)
+    HISTORY_RATE_LIMIT_PER_MINUTE: int = Field(default=30, ge=1, le=1000)
+    HISTORY_MAX_CONCURRENT: int = Field(default=2, ge=1, le=16)
+    CANDLE_STREAM_ENABLED: bool = True
+    CANDLE_STREAM_MAX_SUBSCRIPTIONS: int = Field(default=50, ge=1, le=500)
 
     DATABASE_URL: str = "sqlite:///./data/market_data.db"
     LOG_LEVEL: str = "INFO"
@@ -100,7 +98,7 @@ class Settings(BaseModel):
     WEBSOCKET_STALE_TIMEOUT: float = Field(default=90.0, gt=0)
     DISABLE_BACKGROUND: bool = False
 
-    @field_validator("CORS_ORIGINS", "PUBLIC_ENDPOINTS", "WATCHED_SYMBOLS", mode="before")
+    @field_validator("CORS_ORIGINS", "WATCHED_SYMBOLS", mode="before")
     @classmethod
     def _split_csv(cls, value: Any) -> Any:
         return _csv(value)
@@ -134,7 +132,19 @@ class Settings(BaseModel):
         if self.APP_ENV.lower() == "production":
             if not self.API_KEY or self.API_KEY.startswith("CHANGE_ME"):
                 raise ValueError("API_KEY must be set to a random secret in production")
+            if len(self.API_KEY) < 16:
+                raise ValueError("API_KEY must be at least 16 characters in production")
+            if self.API_KEY_PREVIOUS.startswith("CHANGE_ME"):
+                raise ValueError("API_KEY_PREVIOUS must be empty or a real secret")
         return self
+
+    @property
+    def api_keys(self) -> tuple[str, ...]:
+        """Current and previous keys; used for zero-downtime rotation."""
+        keys = [self.API_KEY]
+        if self.API_KEY_PREVIOUS and self.API_KEY_PREVIOUS != self.API_KEY:
+            keys.append(self.API_KEY_PREVIOUS)
+        return tuple(key for key in keys if key)
 
     @property
     def database_path(self) -> Path:

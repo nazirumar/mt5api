@@ -2,30 +2,33 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
-from typing import Annotated
 
-from fastapi import Header, HTTPException, Request, status
+from fastapi import Request
 
 from ..config import Settings
 
 
+def is_valid_api_key(supplied: str | None, settings: Settings) -> bool:
+    """Constant-time check against current/previous keys."""
+    if not supplied:
+        return False
+    return any(hmac.compare_digest(supplied, key) for key in settings.api_keys)
+
+
 def verify_api_key(request: Request, settings: Settings) -> bool:
+    """Verify the configured REST header on an incoming request."""
+    return is_valid_api_key(request.headers.get(settings.API_KEY_HEADER, ""), settings)
+
+
+def client_identifier(request: Request, settings: Settings) -> str:
+    """Stable, non-secret identifier for per-client limits."""
     supplied = request.headers.get(settings.API_KEY_HEADER, "")
-    expected = settings.API_KEY
-    return bool(supplied and expected and hmac.compare_digest(supplied, expected))
+    if supplied:
+        return "key:" + hashlib.sha256(supplied.encode("utf-8")).hexdigest()[:16]
+    host = request.client.host if request.client else "unknown"
+    return "host:" + host
 
 
-def make_api_key_dependency(settings: Settings):
-    async def require_api_key(
-        api_key: Annotated[str | None, Header(alias=settings.API_KEY_HEADER)] = None,
-    ) -> str:
-        if not api_key or not hmac.compare_digest(api_key, settings.API_KEY):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"code": "UNAUTHORIZED", "message": "Valid API key required"},
-                headers={"WWW-Authenticate": "ApiKey"},
-            )
-        return api_key
-
-    return require_api_key
+__all__ = ["client_identifier", "is_valid_api_key", "verify_api_key"]

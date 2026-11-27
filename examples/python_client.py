@@ -272,11 +272,11 @@ def main() -> int:
     try:
         _print_json("Health", client.health())
 
-        quote = client.quote("XAUUSDm")
-        _print_json("XAUUSDm quote", quote)
+        quote = client.quote("XAUUSD")
+        _print_json("XAUUSD quote", quote)
 
         for timeframe in ("M1", "M5", "H1"):
-            data = client.candles("XAUUSDm", timeframe=timeframe, limit=10)
+            data = client.candles("XAUUSD", timeframe=timeframe, limit=10)
             candles = _items(data)
             print(f"\n{timeframe} candles: {len(candles)} returned")
             for candle in candles[:3]:
