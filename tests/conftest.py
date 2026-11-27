@@ -26,7 +26,13 @@ class FakeMT5:
 
     TIMEFRAME_M1 = 1
     TIMEFRAME_M5 = 5
+    TIMEFRAME_M15 = 12
+    TIMEFRAME_M30 = 13
     TIMEFRAME_H1 = 8
+    TIMEFRAME_H4 = 16
+    TIMEFRAME_D1 = 24
+    TIMEFRAME_W1 = 52
+    TIMEFRAME_MN1 = 72
     COPY_TICKS_ALL = 0
 
     def __init__(self):

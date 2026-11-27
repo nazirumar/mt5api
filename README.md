@@ -22,6 +22,8 @@ A **local, read-only** market data API for MetaTrader 5. It exposes REST and Web
 - [Local domain with Caddy](#local-domain-with-caddy)
 - [Authentication](#authentication)
 - [API reference](#api-reference)
+- [Market context engine](#market-context-engine)
+- [Multi-timeframe snapshot](#multi-timeframe-snapshot)
 - [Client examples](#client-examples)
 - [Windows autostart](#windows-autostart)
 - [Diagnostics](#diagnostics)
@@ -46,6 +48,8 @@ A **local, read-only** market data API for MetaTrader 5. It exposes REST and Web
 - **Request IDs and structured JSON logs** with filterable local events.
 - **Health vs readiness** probes for liveness and authenticated MT5 readiness.
 - **Bounded history** with range caps, rate limiting, and concurrency limits.
+- **Deterministic market context** for quote, trend, regime, momentum, volatility, price position, spread, candle structure, and session state.
+- **Multi-timeframe snapshot** with per-timeframe metadata, explicit failures, cross-timeframe alignment, and retrieval synchronization.
 - **User-level Windows autostart** with a 5-minute watchdog and battery-safe Task Scheduler settings.
 - **Optional local domain** via Caddy at `http://mt5.nazbeen.test`.
 - **SQLite-backed diagnostics** and local PowerShell status tools.
@@ -79,6 +83,8 @@ Browser / curl / Python / Next.js
 | BrokerClock | Converts broker-server time to real UTC from fresh ticks |
 | MarketCollector | Polls quotes and completed candles once for all clients |
 | HistoryLimiter | Per-client rate limit and global concurrency cap |
+| MarketContextEngine | Deterministic, read-only snapshots from cached/live MT5 data |
+| SnapshotEngine | Bounded multi-timeframe coordination over the same Phase 18 data/analytics |
 | SQLite | Local operational/diagnostic records |
 | Caddy | Friendly local hostname; no public TLS or exposure |
 | Watchdog | Five-minute self-healing task for API, terminal and proxy |
@@ -205,6 +211,39 @@ Leave `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER` empty if the terminal is alr
 | `CANDLE_STREAM_MAX_SUBSCRIPTIONS` | `50` | Maximum candle pairs per WebSocket client message. |
 | `WEBSOCKET_HEARTBEAT_INTERVAL` | `30` | WebSocket ping interval. |
 | `WEBSOCKET_STALE_TIMEOUT` | `90` | Stale client timeout. |
+
+### Market context settings
+
+All context thresholds have defaults and are documented in `.env.example` and
+`docs/PHASE_18_MARKET_CONTEXT_ENGINE.md`. Commonly adjusted values:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `CONTEXT_DEFAULT_TIMEFRAME` | `M5` | Primary timeframe when none is requested. |
+| `CONTEXT_DEFAULT_LOOKBACK` | `100` | Default completed candles per timeframe. |
+| `CONTEXT_MAX_LOOKBACK` | `500` | Hard ceiling for `lookback`. |
+| `CONTEXT_MAX_TIMEFRAMES` | `4` | Maximum timeframes in one request. |
+| `CONTEXT_MIN_CANDLES` | `10` | Minimum completed candles for usable context. |
+| `CONTEXT_CANDLE_CACHE_SECONDS` | `30` | TTL for reused candle series. |
+| `CONTEXT_QUOTE_VERY_STALE_MULTIPLIER` | `6` | Very-stale threshold multiplier. |
+| `CONTEXT_SESSION_TIMEZONE` | `UTC` | IANA timezone for session windows; DST-aware. |
+| `CONTEXT_SESSION_WINDOWS` | empty | Optional `London=7-16,New York=12-21` style override. |
+
+### Multi-timeframe snapshot settings
+
+All snapshot settings are additive and bounded for the low-resource Windows host. Full details are in `docs/PHASE_19_MULTI_TIMEFRAME_SNAPSHOT.md`.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `SNAPSHOT_DEFAULT_TIMEFRAMES` | `M1,M5,M15,H1,H4,D1` | Default timeframe list. |
+| `SNAPSHOT_MAX_TIMEFRAMES` | `7` | Maximum timeframes in one request. |
+| `SNAPSHOT_DEFAULT_LIMIT` | `100` | Default candles requested per timeframe. |
+| `SNAPSHOT_MAX_LIMIT` | `500` | Hard ceiling for `limit`. |
+| `SNAPSHOT_MAX_CANDLES_PER_TIMEFRAME` | `100` | Maximum candles returned per timeframe. |
+| `SNAPSHOT_SYNC_TIGHT_SECONDS` | `2` | Tight retrieval tolerance. |
+| `SNAPSHOT_ACCEPTABLE_SYNC_SECONDS` | `10` | Acceptable retrieval tolerance. |
+| `SNAPSHOT_MIN_ALIGNED_TIMEFRAMES` | `2` | Minimum analyzable timeframes for alignment. |
+| `SNAPSHOT_ALIGNMENT_DOMINANT_RATIO` | `0.6` | Dominant-direction threshold for descriptive alignment. |
 
 ---
 
@@ -336,6 +375,8 @@ http://mt5.nazbeen.test          # with Caddy + hosts entry
 | `GET` | `/api/v1/quotes?symbols=EURUSD,XAUUSD` | Key | Batch quotes |
 | `GET` | `/api/v1/quote/{symbol}` | Key | Single quote |
 | `GET` | `/api/v1/market/sessions` | Key | Market session information |
+| `GET` | `/api/v1/market/context/{symbol}?timeframe=M5&lookback=100` | Key | Deterministic market context snapshot |
+| `GET` | `/api/v1/market/snapshot/{symbol}?timeframes=M15,H1,H4,D1&limit=100` | Key | Bounded multi-timeframe snapshot |
 | `GET` | `/api/v1/candles/{symbol}?timeframe=M5&limit=500` | Key | OHLC candles |
 | `GET` | `/api/v1/ticks/{symbol}?start=2026-01-01T00:00:00Z` | Key | Tick history |
 | `GET` | `/api/v1/account` | Key | Read-only account diagnostics |
@@ -409,6 +450,45 @@ Server message types: `auth_required`, `authenticated`, `welcome`, `subscribed`,
 
 Prefer `completed: true` candles for analysis and backtests. The current timeframe bar is marked `false` and changes until the interval closes.
 
+### Market context engine
+
+`GET /api/v1/market/context/{symbol}` returns a deterministic, read-only
+snapshot containing quote context, trend, regime, momentum, volatility, price
+position, spread intelligence, candle structure, session context, and a
+0-100 data-quality score. All calculations use completed candles and real MT5
+quotes; no model, signal, order, or fabricated value is involved.
+
+```text
+GET /api/v1/market/context/XAUUSDm?timeframe=M5&lookback=100
+GET /api/v1/market/context/EURUSDm?timeframes=M5,M15,H1&include_candles=true
+```
+
+Classifications are descriptive measurements, not buy/sell signals or outcome
+predictions. Session hours are approximate and not broker-verified. Full
+methodology, thresholds, response shape, limitations, and troubleshooting are
+in `docs/PHASE_18_MARKET_CONTEXT_ENGINE.md`.
+
+### Multi-timeframe snapshot
+
+`GET /api/v1/market/snapshot/{symbol}` assembles one broker-native symbol across
+several MT5 timeframes in one bounded response. It reuses the Phase 18 engine
+for every per-timeframe context and adds explicit metadata, per-timeframe
+errors, cross-timeframe alignment, retrieval synchronization, and snapshot-level
+completeness. Defaults and hard caps keep the request lightweight.
+
+```text
+GET /api/v1/market/snapshot/EURUSDm?timeframes=M1,M5,H1&limit=100
+GET /api/v1/market/snapshot/XAUUSDm?timeframes=M15,H1,H4,D1&include_candles=false
+```
+
+`snapshot_status` is `COMPLETE`, `PARTIAL`, or `UNAVAILABLE`. A failed timeframe
+is reported in `timeframes.<tf>.error` without failing the whole request. Candle
+close-time differences are reported separately from retrieval synchronization;
+the response never claims simultaneous fetches. Alignment counts describe
+agreement among Phase 18 trend classifications and are not signals,
+probabilities, or forecasts. Full methodology, configuration, examples, and
+troubleshooting are in `docs/PHASE_19_MULTI_TIMEFRAME_SNAPSHOT.md`.
+
 ---
 
 ## Client examples
@@ -423,6 +503,7 @@ $H    = @("X-API-Key: $Key")
 curl.exe -s "$Base/api/v1/health"
 curl.exe -s -H $H "$Base/api/v1/quotes?symbols=EURUSD,XAUUSD"
 curl.exe -s -H $H "$Base/api/v1/candles/EURUSD?timeframe=M5&limit=100"
+curl.exe -s -H $H --get --data-urlencode "timeframes=M15,H1,H4,D1" --data-urlencode "limit=100" "$Base/api/v1/market/snapshot/XAUUSDm"
 curl.exe -s -H $H --get --data-urlencode "start=2026-01-01T00:00:00Z" "$Base/api/v1/ticks/EURUSD"
 ```
 
@@ -440,30 +521,47 @@ from python_client import MT5MarketDataClient
 client = MT5MarketDataClient()
 quote = client.quote("EURUSD")
 candles = client.candles("EURUSD", timeframe="M5", limit=100)
+
+snapshot = client.market_snapshot(
+    "XAUUSDm", timeframes="M15,H1,H4,D1", limit=100
+)
+print(snapshot["snapshot_status"], snapshot["alignment"]["classification"])
 ```
 
 ### Next.js
 
+Use a server-side Route Handler. The API key must stay in the server environment; `NEXT_PUBLIC_*` values are embedded in browser JavaScript.
+
 ```dotenv
-NEXT_PUBLIC_MT5_API_BASE=http://mt5.nazbeen.test
-NEXT_PUBLIC_API_KEY=your-long-random-secret
+# Server-only secrets (do not prefix with NEXT_PUBLIC_).
+MT5_API_BASE_URL=http://mt5.nazbeen.test
+API_KEY=your-long-random-secret
 ```
 
 ```ts
-import { fetchHealth, fetchQuotes, createMarketSocket } from "./examples/nextjs_client";
+// app/api/market/route.ts
+import {
+  fetchHealth,
+  fetchQuotes,
+  fetchMarketContext,
+  fetchMarketSnapshot,
+} from "@/examples/nextjs_client";
 
-const health = await fetchHealth();
-const quotes = await fetchQuotes(["EURUSD", "XAUUSD"]);
-
-const socket = createMarketSocket({
-  symbols: ["EURUSD"],
-  onQuote: (quote) => console.log(quote),
-  onStatus: (status) => console.log("socket:", status),
-  onError: (err) => console.error(err),
-});
+export async function GET() {
+  const health = await fetchHealth();
+  const quotes = await fetchQuotes(["EURUSD", "XAUUSD"]);
+  const context = await fetchMarketContext("XAUUSDm", {
+    timeframes: "M5,M15,H1",
+  });
+  const snapshot = await fetchMarketSnapshot("XAUUSDm", {
+    timeframes: "M15,H1,H4,D1",
+    limit: 100,
+  });
+  return Response.json({ health, quotes, context, snapshot });
+}
 ```
 
-> `NEXT_PUBLIC_*` variables are embedded in browser JavaScript. Prefer a server-side route that keeps the API key out of the bundle. See `examples/nextjs_client.ts` for compatibility behavior.
+The bundled WebSocket helper uses first-message auth and is also intended for server-side use. Never put an API key in `NEXT_PUBLIC_*` variables or a browser bundle.
 
 ---
 
@@ -536,7 +634,7 @@ Tests use a fake MT5 module; no live broker account is required.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The suite covers REST endpoints, WebSockets, first-message auth, candle streams, authentication and rotation, request IDs, broker-clock conversion, history bounds, PowerShell script parsing, and CI/bootstrap metadata. GitHub Actions runs the same suite on Windows with Python 3.12 and 3.13.
+The suite covers REST endpoints, WebSockets, first-message auth, candle streams, authentication and rotation, request IDs, broker-clock conversion, history bounds, deterministic context analytics, multi-timeframe alignment/synchronization, mocked-MT5 snapshot scenarios, PowerShell script parsing, and CI/bootstrap metadata. GitHub Actions runs the same suite on Windows with Python 3.12 and 3.13. Tests use mocked MT5 only; they do not claim live broker verification.
 
 ---
 
@@ -546,14 +644,17 @@ The suite covers REST endpoints, WebSockets, first-message auth, candle streams,
 mt5api/
 ├── app/
 │   ├── api/          # REST routers and WebSocket endpoints
-│   ├── core/         # Security, lifecycle, context, structured logging
+│   ├── context/      # Phase 18 deterministic analytics and context engine
+│   ├── core/         # Security, lifecycle, request context, structured logging
 │   ├── database/     # SQLite models and repositories
 │   ├── mt5/          # Connection, symbols, quotes, candles, ticks, clock
 │   ├── schemas/      # Pydantic response models
-│   └── services/     # Collector, caches, subscriptions, limiter, monitor
+│   ├── services/     # Collector, caches, subscriptions, limiter, monitor
+│   └── snapshot/     # Phase 19 multi-timeframe coordination/alignment
 ├── .github/workflows/ci.yml
 ├── caddy/Caddyfile
 ├── data/
+├── docs/             # Phase 17/18/19 audits, plans, and methodology
 ├── examples/         # Python, Next.js, and WebSocket clients
 ├── logs/
 ├── scripts/          # Install, autostart, domain, and diagnostic helpers

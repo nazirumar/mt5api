@@ -16,6 +16,7 @@ from . import __version__
 from .api import ok
 from .api.router import api_router, websocket_router
 from .config import Settings, get_settings
+from .context import MarketContextEngine
 from .core.context import get_request_id, new_request_id, request_id_var
 from .core.exceptions import ServiceError
 from .core.lifecycle import RuntimeState, iso_utc
@@ -36,6 +37,7 @@ from .services.connection_monitor import ConnectionMonitor
 from .services.history_limiter import HistoryLimiter
 from .services.market_collector import MarketCollector
 from .services.subscription_manager import SubscriptionManager
+from .snapshot import SnapshotEngine
 
 logger = get_logger("nazbeen_mt5.app")
 
@@ -80,6 +82,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             subscriptions, database["session_factory"],
         )
         monitor = ConnectionMonitor(settings, manager, collector)
+        context_engine = MarketContextEngine(
+            settings, manager, symbols, quotes, candles, cache, clock
+        )
+        snapshot_engine = SnapshotEngine(settings, context_engine)
         context = AppContext(
             settings=settings,
             runtime=runtime,
@@ -96,6 +102,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             collector=collector,
             monitor=monitor,
             history_limiter=history_limiter,
+            context_engine=context_engine,
+            snapshot_engine=snapshot_engine,
             database=database,
         )
         app.state.context = context

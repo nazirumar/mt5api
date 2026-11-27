@@ -55,6 +55,7 @@ class CandleService:
         limit: int | None = None,
         start: str | None = None,
         end: str | None = None,
+        info: Any | None = None,
     ) -> dict[str, Any]:
         tf = normalize_timeframe(timeframe)
         module = self.manager.module()
@@ -63,7 +64,8 @@ class CandleService:
         if count <= 0:
             raise InvalidRequestError("limit must be greater than zero")
 
-        info = self.manager.call("symbol_info", symbol, allow_none=True)
+        if info is None:
+            info = self.manager.call("symbol_info", symbol, allow_none=True)
         if info is None:
             raise SymbolNotFoundError(f"Symbol '{symbol}' was not found on this broker")
         self._ensure_selected(symbol)

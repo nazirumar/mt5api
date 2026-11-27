@@ -242,6 +242,71 @@ class MT5MarketDataClient:
         """Get read-only broker account information."""
         return self._data(self._request("/api/v1/account"))
 
+    def market_context(
+        self,
+        symbol: str,
+        *,
+        timeframe: str | None = None,
+        timeframes: str | None = None,
+        lookback: int | None = None,
+        include_candles: bool = False,
+        include_indicators: bool = True,
+        include_structure: bool = True,
+    ) -> Any:
+        """Get a deterministic market context snapshot from real MT5 data.
+
+        Classifications are descriptive measurements, not trading signals.
+        Use broker-native symbols (for example XAUUSDm), not guessed tickers.
+        """
+        params: dict[str, Any] = {
+            "timeframe": timeframe,
+            "timeframes": timeframes,
+            "lookback": lookback,
+            "include_candles": include_candles,
+            "include_indicators": include_indicators,
+            "include_structure": include_structure,
+        }
+        # Omit None values so server defaults apply; normalize booleans for URLs.
+        params = {
+            key: (str(value).lower() if isinstance(value, bool) else value)
+            for key, value in params.items()
+            if value is not None
+        }
+        safe = url_quote(symbol, safe="")
+        return self._data(self._request(f"/api/v1/market/context/{safe}", params=params))
+
+    def market_snapshot(
+        self,
+        symbol: str,
+        *,
+        timeframes: str | None = None,
+        limit: int | None = None,
+        include_context: bool = True,
+        include_candles: bool = True,
+        include_indicators: bool = True,
+        include_structure: bool = True,
+    ) -> Any:
+        """Get a bounded multi-timeframe snapshot from real MT5 data.
+
+        Per-timeframe failures are reported in the payload; alignment and
+        synchronization fields are descriptive, not trading signals.
+        """
+        params: dict[str, Any] = {
+            "timeframes": timeframes,
+            "limit": limit,
+            "include_context": include_context,
+            "include_candles": include_candles,
+            "include_indicators": include_indicators,
+            "include_structure": include_structure,
+        }
+        params = {
+            key: (str(value).lower() if isinstance(value, bool) else value)
+            for key, value in params.items()
+            if value is not None
+        }
+        safe = url_quote(symbol, safe="")
+        return self._data(self._request(f"/api/v1/market/snapshot/{safe}", params=params))
+
 
 def _items(data: Any) -> list[Any]:
     """Extract a list from common response shapes without assuming field names."""
@@ -281,6 +346,16 @@ def main() -> int:
             print(f"\n{timeframe} candles: {len(candles)} returned")
             for candle in candles[:3]:
                 print(candle)
+
+        # Replace XAUUSD with your broker-native symbol, including any suffix.
+        context = client.market_context("XAUUSD", timeframe="M5", lookback=50)
+        if isinstance(context, dict):
+            quality = context.get("data_quality", {})
+            summary = context.get("context", {})
+            print("\nMarket context (descriptive only; not a trading signal):")
+            print(f"  data quality: {quality.get('grade', 'UNKNOWN')}")
+            print(f"  trend:        {summary.get('trend', {}).get('classification', 'UNKNOWN')}")
+            print(f"  regime:       {summary.get('regime', {}).get('classification', 'UNKNOWN')}")
 
         return 0
 

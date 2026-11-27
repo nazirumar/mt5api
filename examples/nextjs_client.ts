@@ -1,14 +1,15 @@
 /**
- * Browser-safe TypeScript client for the Nazbeen MT5 Market Data API.
+ * Server-side TypeScript client for the Nazbeen MT5 Market Data API.
  *
  * Environment:
- *   NEXT_PUBLIC_MT5_API_BASE  Default: http://mt5.nazbeen.test
- *   NEXT_PUBLIC_API_KEY   Required for authenticated calls and WebSocket
- *                         (NEXT_PUBLIC_MT5_API_KEY accepted as a compatibility fallback)
+ *   MT5_API_BASE_URL          Optional; NEXT_PUBLIC_MT5_API_BASE accepted for
+ *                             the non-secret base URL only.
+ *   API_KEY / MT5_API_KEY     Required server-side secret for authenticated
+ *                             REST calls and first-frame WebSocket auth.
  *
- * Security note: NEXT_PUBLIC_* values are embedded in browser JavaScript.
- * Use these helpers only for local development, or proxy through a server-side
- * Next.js route that keeps the real API key private.
+ * Security note: NEXT_PUBLIC_* values are embedded in browser JavaScript and
+ * must never contain an API key. Call these helpers from Next.js Route Handlers
+ * or Server Components, then expose only the sanitized result to the browser.
  *
  * This client is read-only. It never sends trading commands.
  */
@@ -142,20 +143,16 @@ export class MT5ApiError extends Error {
 }
 
 function getBaseUrl(): string {
-  return (process.env.NEXT_PUBLIC_MT5_API_BASE || "http://mt5.nazbeen.test").replace(
-    /\/+$/,
-    "",
-  );
+  return (
+    process.env.MT5_API_BASE_URL ||
+    process.env.NEXT_PUBLIC_MT5_API_BASE ||
+    "http://mt5.nazbeen.test"
+  ).replace(/\/+$/, "");
 }
 
 function getApiKey(): string | undefined {
-  return (
-    process.env.NEXT_PUBLIC_API_KEY ||
-    process.env.API_KEY ||
-    process.env.NEXT_PUBLIC_MT5_API_KEY ||
-    process.env.MT5_API_KEY ||
-    undefined
-  );
+  // Server-only secrets. Never read NEXT_PUBLIC_* keys into a browser bundle.
+  return process.env.API_KEY || process.env.MT5_API_KEY || undefined;
 }
 
 interface RequestOptions {
@@ -179,7 +176,7 @@ async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<
     const apiKey = getApiKey();
     if (!apiKey) {
       throw new MT5ApiError(
-        "NEXT_PUBLIC_API_KEY is not set.",
+        "API_KEY or MT5_API_KEY is not set in the server environment.",
         "MISSING_API_KEY",
       );
     }
@@ -268,6 +265,116 @@ export async function fetchCandles(
   });
 }
 
+export interface MarketContextOptions {
+  timeframe?: Timeframe | string;
+  /** Comma-separated timeframes, e.g. "M1,M5,H1"; overrides `timeframe`. */
+  timeframes?: string;
+  lookback?: number;
+  includeCandles?: boolean;
+  includeIndicators?: boolean;
+  includeStructure?: boolean;
+}
+
+export interface MarketContext {
+  symbol: string;
+  generated_at: string;
+  market_status: string;
+  quote: Record<string, unknown>;
+  /** Descriptive classifications; never trading signals. */
+  context: Record<string, unknown>;
+  data_quality: Record<string, unknown>;
+  timeframes: Record<string, unknown>;
+  session: Record<string, unknown>;
+  meta?: Meta;
+  [key: string]: unknown;
+}
+
+/**
+ * Deterministic market-context snapshot derived from real MT5 data.
+ *
+ * Call this from a server-side Next.js Route Handler that reads a private
+ * API_KEY from process.env. Never ship the key in NEXT_PUBLIC_* variables or
+ * browser bundles. Use broker-native symbols, including any broker suffix.
+ */
+export async function fetchMarketContext(
+  symbol: string,
+  options: MarketContextOptions = {},
+): Promise<MarketContext> {
+  if (!symbol.trim()) {
+    throw new MT5ApiError("A symbol is required.", "INVALID_INPUT");
+  }
+  return apiFetch<MarketContext>(
+    `/api/v1/market/context/${encodeURIComponent(symbol.trim())}`,
+    {
+      params: {
+        timeframe: options.timeframe,
+        timeframes: options.timeframes,
+        lookback: options.lookback,
+        include_candles: options.includeCandles,
+        include_indicators: options.includeIndicators,
+        include_structure: options.includeStructure,
+      },
+    },
+  );
+}
+
+export interface MarketSnapshotOptions {
+  /** Comma-separated MT5 timeframes, e.g. "M15,H1,H4,D1". */
+  timeframes?: string;
+  /** Candles requested per timeframe, bounded by the server. */
+  limit?: number;
+  includeContext?: boolean;
+  includeCandles?: boolean;
+  includeIndicators?: boolean;
+  includeStructure?: boolean;
+}
+
+export interface MarketSnapshot {
+  snapshot_id: string;
+  symbol: string;
+  generated_at: string;
+  /** COMPLETE, PARTIAL, or UNAVAILABLE. */
+  snapshot_status: string;
+  synchronization: Record<string, unknown>;
+  quote: Record<string, unknown>;
+  timeframes: Record<string, unknown>;
+  /** Descriptive agreement counts; never a signal or probability. */
+  alignment: Record<string, unknown>;
+  session: Record<string, unknown>;
+  data_quality: Record<string, unknown>;
+  warnings: string[];
+  meta?: Meta;
+  [key: string]: unknown;
+}
+
+/**
+ * Bounded multi-timeframe snapshot derived from real MT5 data.
+ *
+ * Call from a server-side Next.js Route Handler. Return only the fields your
+ * UI needs; keep the API key in process.env and out of NEXT_PUBLIC_* variables.
+ */
+export async function fetchMarketSnapshot(
+  symbol: string,
+  options: MarketSnapshotOptions = {},
+): Promise<MarketSnapshot> {
+  if (!symbol.trim()) {
+    throw new MT5ApiError("A symbol is required.", "INVALID_INPUT");
+  }
+  return apiFetch<MarketSnapshot>(
+    `/api/v1/market/snapshot/${encodeURIComponent(symbol.trim())}`,
+    {
+      params: {
+        timeframes: options.timeframes,
+        limit: options.limit,
+        include_context: options.includeContext,
+        include_candles: options.includeCandles,
+        include_indicators: options.includeIndicators,
+        include_structure: options.includeStructure,
+      },
+    },
+  );
+}
+
 function toWebSocketBase(baseUrl: string): string {
   const url = new URL(baseUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -284,7 +391,7 @@ function buildWebSocketUrl(): string {
 
 export interface MarketSocketOptions {
   symbols: string[];
-  /** Defaults to NEXT_PUBLIC_API_KEY if omitted. */
+  /** Defaults to server-only API_KEY / MT5_API_KEY if omitted. */
   apiKey?: string;
   /** Optional completed-candle subscriptions. */
   candles?: Array<{ symbol: string; timeframe: string }>;

@@ -29,6 +29,8 @@ class AppContext:
     collector: Any
     monitor: Any
     history_limiter: Any
+    context_engine: Any
+    snapshot_engine: Any
     database: dict[str, Any]
 
 

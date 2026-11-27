@@ -65,8 +65,10 @@ class QuoteService:
             "status": "ok" if has_price else "no_tick",
         }
 
-    def get_quote(self, symbol: str) -> dict[str, Any]:
-        info = self.manager.call("symbol_info", symbol, allow_none=True)
+    def get_quote(self, symbol: str, info: Any | None = None) -> dict[str, Any]:
+        """Return one live quote; callers may reuse already-fetched symbol info."""
+        if info is None:
+            info = self.manager.call("symbol_info", symbol, allow_none=True)
         if info is None:
             from ..core.exceptions import SymbolNotFoundError
 
