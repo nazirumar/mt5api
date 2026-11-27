@@ -79,6 +79,22 @@ def test_watchdog_runs_every_five_minutes_and_is_battery_safe():
     assert "DontStopIfGoingOnBatteries" in installer
 
 
+def test_watchdog_repair_arguments_splat_as_named_parameters():
+    text = (SCRIPTS / "watchdog.ps1").read_text(encoding="utf-8-sig")
+    assert "[hashtable]$Arguments" in text
+    assert (
+        text.count("-Arguments @{ Port = $effectivePort; WaitSeconds = $WaitSeconds }")
+        == 3
+    )
+    assert "-Arguments @('-Port'" not in text
+
+
+def test_watchdog_json_mode_suppresses_helper_output():
+    text = (SCRIPTS / "watchdog.ps1").read_text(encoding="utf-8-sig")
+    assert "if ($Json)" in text
+    assert "& $path @Arguments *>$null" in text
+
+
 def test_bootstrap_delegates_to_installer():
     text = (SCRIPTS / "bootstrap.ps1").read_text(encoding="utf-8-sig")
     assert "install.ps1" in text

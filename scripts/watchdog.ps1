@@ -75,14 +75,20 @@ function Test-RestartAllowed {
 function Invoke-RepairScript {
     param(
         [Parameter(Mandatory)][string]$Name,
-        [string[]]$Arguments = @()
+        [hashtable]$Arguments = @{}
     )
     $path = Join-Path $script:ScriptsDir $Name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         Write-AutostartLog ("ERROR: watchdog helper missing: {0}" -f $Name)
         return 1
     }
-    & $path @Arguments
+    # Helper scripts use Write-Host for progress. In JSON mode, keep stdout
+    # machine-readable by redirecting every stream to the autostart log only.
+    if ($Json) {
+        & $path @Arguments *>$null
+    } else {
+        & $path @Arguments
+    }
     $code = $LASTEXITCODE
     if ($code -gt 1) {
         Write-AutostartLog ("WARN: {0} exited with code {1}" -f $Name, $code)
@@ -139,10 +145,10 @@ if ($terminalProcesses.Count -eq 0 -and (Get-ConfigBool -Key 'MT5_START_TERMINAL
 
 if (-not $health.Reachable) {
     if (Test-PortListening -Port $effectivePort) {
-        $code = Invoke-RepairScript -Name 'restart_api.ps1' -Arguments @('-Port', [string]$effectivePort, '-WaitSeconds', [string]$WaitSeconds)
+        $code = Invoke-RepairScript -Name 'restart_api.ps1' -Arguments @{ Port = $effectivePort; WaitSeconds = $WaitSeconds }
         $result.Action = 'api-restarted'
     } else {
-        $code = Invoke-RepairScript -Name 'start_api.ps1' -Arguments @('-Port', [string]$effectivePort, '-WaitSeconds', [string]$WaitSeconds)
+        $code = Invoke-RepairScript -Name 'start_api.ps1' -Arguments @{ Port = $effectivePort; WaitSeconds = $WaitSeconds }
         $result.Action = 'api-started'
     }
     if ($code -eq 0) {
@@ -154,7 +160,7 @@ if (-not $health.Reachable) {
     }
 } elseif ($terminalStarted -or -not $health.TerminalConnected) {
     if (@(Get-MT5Processes).Count -gt 0 -and (Test-RestartAllowed)) {
-        $code = Invoke-RepairScript -Name 'restart_api.ps1' -Arguments @('-Port', [string]$effectivePort, '-WaitSeconds', [string]$WaitSeconds)
+        $code = Invoke-RepairScript -Name 'restart_api.ps1' -Arguments @{ Port = $effectivePort; WaitSeconds = $WaitSeconds }
         if ($code -eq 0) {
             $result.Action = 'api-restarted'
             $result.ApiRestarted = $true
